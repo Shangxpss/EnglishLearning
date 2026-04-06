@@ -1,0 +1,21 @@
+[project]
+name = "english-app-backend"
+version = "1.0.0"
+description = "English Learning API"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.5.0",
+    "psycopg2-binary>=2.9.9",
+    "python-dotenv>=1.0.0",
+    "langchain>=0.1.0",
+    "langchain-openai>=0.0.5",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]

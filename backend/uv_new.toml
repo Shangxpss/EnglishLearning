@@ -1,0 +1,8 @@
+[pip]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+extra-index-urls = [
+    "https://pypi.org/simple/"
+]
+trusted-hosts = [
+    "pypi.tuna.tsinghua.edu.cn"
+]

@@ -1,0 +1,6 @@
+fastapi[standard]>=0.135.3
+faster-whisper>=1.2.1
+ffmpeg-python>=0.2.0
+librosa>=0.10.0
+numpy>=1.24.0
+uvicorn>=0.29.0
