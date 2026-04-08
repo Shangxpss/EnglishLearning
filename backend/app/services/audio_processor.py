@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import os
 from typing import Dict, Any
-import ffmpeg
+import av
 
 
 class AudioProcessor:
@@ -76,13 +76,26 @@ class AudioProcessor:
 
     def extract_audio_from_video(self, video_path: str, audio_path: str) -> bool:
         """
-        Extract audio from video file
+        Extract audio from video file using PyAV
         """
         try:
-            stream = ffmpeg.input(video_path)
-            stream = ffmpeg.output(
-                stream, audio_path, acodec='pcm_s16le', ac=1, ar='16k')
-            ffmpeg.run(stream, overwrite_output=True, quiet=True)
+            container = av.open(video_path)
+            stream = next(s for s in container.streams if s.type == 'audio')
+            
+            with av.open(audio_path, 'w') as output:
+                output_stream = output.add_stream('pcm_s16le', rate=16000)
+                output_stream.channel_layout = 'mono'
+                
+                for packet in container.demux(stream):
+                    for frame in packet.decode():
+                        frame.pts = None
+                        for packet in output_stream.encode(frame):
+                            output.mux(packet)
+                
+                # Flush the encoder
+                for packet in output_stream.encode():
+                    output.mux(packet)
+            
             return True
         except Exception as e:
             raise Exception(f"Error extracting audio from video: {str(e)}")

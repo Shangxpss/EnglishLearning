@@ -45,7 +45,6 @@ class SubtitleGenerator:
         Generate SRT subtitle file
         """
         try:
-            import ffmpeg
             subtitles = self.generate_subtitles(
                 audio_path, language, model_size)
 
@@ -79,10 +78,10 @@ class SubtitleGenerator:
             subtitles = []
             with open(subtitle_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-                
+
             # Split by subtitle blocks
             blocks = content.strip().split('\n\n')
-            
+
             for i, block in enumerate(blocks, 1):
                 lines = block.strip().split('\n')
                 if len(lines) >= 3:
@@ -92,10 +91,10 @@ class SubtitleGenerator:
                         # Time is lines[1]
                         time_line = lines[1]
                         start_time, end_time = time_line.split(' --> ')
-                        
+
                         # Extract text (lines[2] and beyond)
                         text = ' '.join(lines[2:]).strip()
-                        
+
                         subtitle = {
                             "id": i,
                             "start": self._parse_srt_time(start_time),
@@ -106,7 +105,7 @@ class SubtitleGenerator:
                     except Exception as e:
                         # Skip malformed blocks
                         continue
-            
+
             return subtitles
         except Exception as e:
             raise Exception(f"Error parsing subtitle file: {str(e)}")
@@ -122,7 +121,7 @@ class SubtitleGenerator:
             sec_millis = parts[2].split(',')
             seconds = int(sec_millis[0])
             milliseconds = int(sec_millis[1]) if len(sec_millis) > 1 else 0
-            
+
             total_seconds = hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
             return total_seconds
         except Exception as e:
@@ -130,7 +129,7 @@ class SubtitleGenerator:
 
     def extract_keywords(self, subtitles: List[Dict[str, Any]]) -> List[str]:
         """
-        Extract keywords from subtitles, filtering out simple words
+        Extract keywords from subtitles, filtering out simple words, numbers, and non-word tokens
         """
         try:
             # Common simple words to filter out
@@ -146,18 +145,29 @@ class SubtitleGenerator:
                 'than', 'so', 'because', 'since', 'until', 'while', 'after', 'before',
                 'during', 'though', 'although', 'unless', 'except', 'without', 'within'
             }
-            
+
             import re
             keywords = set()
-            
+
             for subtitle in subtitles:
                 text = subtitle.get('text', '')
                 # Extract words using regex, removing punctuation
                 words = re.findall(r'\b\w+\b', text.lower())
-                # Filter out simple words and single-character words
-                filtered_words = [word for word in words if word not in simple_words and len(word) > 1]
-                keywords.update(filtered_words)
-            
+
+                for word in words:
+                    # Filter out:
+                    # 1. Simple words
+                    # 2. Single-character words
+                    # 3. Pure numbers
+                    # 4. Alphanumeric strings that contain numbers
+                    # 5. Strings that are too long (likely concatenated words)
+                    if (word not in simple_words and
+                        len(word) > 1 and
+                        len(word) < 20 and
+                        not word.isdigit() and
+                            not any(c.isdigit() for c in word)):
+                        keywords.add(word)
+
             # Convert to sorted list
             return sorted(list(keywords))
         except Exception as e:
