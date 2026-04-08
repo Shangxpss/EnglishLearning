@@ -1,8 +1,6 @@
-from faster_whisper import WhisperModel
 import os
 import tempfile
 from typing import List, Dict, Any
-import ffmpeg
 
 
 class SubtitleGenerator:
@@ -15,6 +13,7 @@ class SubtitleGenerator:
         Generate subtitles for audio file
         """
         try:
+            from faster_whisper import WhisperModel
             # Load model if not already loaded
             if model_size not in self.models:
                 self.models[model_size] = WhisperModel(
@@ -46,6 +45,7 @@ class SubtitleGenerator:
         Generate SRT subtitle file
         """
         try:
+            import ffmpeg
             subtitles = self.generate_subtitles(
                 audio_path, language, model_size)
 

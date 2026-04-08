@@ -5,8 +5,6 @@ import os
 import tempfile
 import subprocess
 import uuid
-from .services.audio_processor import AudioProcessor
-from .services.subtitle_generator import SubtitleGenerator
 from .models.response_models import SubtitleItem, SubtitleResponse, AudioAnalysisResponse, WordExtractionResponse
 
 app = FastAPI(
@@ -16,8 +14,17 @@ app = FastAPI(
 )
 
 # Initialize services
-audio_processor = AudioProcessor()
-subtitle_generator = SubtitleGenerator()
+try:
+    from .services.audio_processor import AudioProcessor
+    audio_processor = AudioProcessor()
+except ImportError:
+    audio_processor = None
+
+try:
+    from .services.subtitle_generator import SubtitleGenerator
+    subtitle_generator = SubtitleGenerator()
+except ImportError:
+    subtitle_generator = None
 
 
 @app.get("/")
@@ -107,6 +114,13 @@ async def upload_subtitle(
     Upload subtitle file and extract keywords
     """
     try:
+        if not subtitle_generator:
+            return WordExtractionResponse(
+                success=False,
+                words=[],
+                message="Subtitle generator service is not available"
+            )
+        
         # Save uploaded file temporarily
         temp_filename = f"temp_{uuid.uuid4()}_{file.filename}"
         with open(temp_filename, "wb") as buffer:

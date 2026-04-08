@@ -11,6 +11,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "langchain>=0.1.0",
     "langchain-openai>=0.0.5",
+    "python-multipart>=0.0.24",
+    "faster-whisper>=1.2.1",
 ]
 
 [tool.uv]
