@@ -14,6 +14,7 @@ dependencies = [
     "python-multipart>=0.0.24",
     "faster-whisper>=1.2.1",
     "librosa>=0.11.0",
+    "huggingface-hub>=1.9.2",
 ]
 
 [tool.uv]

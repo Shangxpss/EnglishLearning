@@ -11,7 +11,7 @@ class AudioProcessor:
     def __init__(self):
         pass
 
-    def process_audio_with_subtitles(self, audio_path: str, language: str = "en", model_size: str = "small") -> Dict[str, Any]:
+    def process_audio_with_subtitles(self, audio_path: str, language: str = "en", model_size: str = "medium.en") -> Dict[str, Any]:
         """
         Process audio file, generate subtitles, and extract keywords
         """
@@ -123,7 +123,7 @@ class AudioProcessor:
 
             with av.open(audio_path, 'w') as output:
                 output_stream = output.add_stream('pcm_s16le', rate=16000)
-                output_stream.channel_layout = 'mono'
+                output_stream.layout = 'mono'
 
                 for packet in container.demux(stream):
                     for frame in packet.decode():

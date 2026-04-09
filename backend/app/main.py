@@ -49,6 +49,13 @@ async def transcribe_audio(
             buffer.write(content)
 
         # Process audio and generate subtitles
+        if not subtitle_generator:
+            return SubtitleResponse(
+                success=False,
+                subtitles=[],
+                message="Subtitle generator service is not available"
+            )
+
         result = subtitle_generator.generate_subtitles(
             temp_filename, language, model_size)
 
@@ -83,6 +90,13 @@ async def analyze_audio(
             buffer.write(content)
 
         # Analyze audio
+        if not audio_processor:
+            return AudioAnalysisResponse(
+                success=False,
+                analysis={},
+                message="Audio processor service is not available"
+            )
+
         analysis = audio_processor.analyze_audio(temp_filename)
 
         # Clean up temporary file
@@ -120,7 +134,7 @@ async def upload_subtitle(
                 words=[],
                 message="Subtitle generator service is not available"
             )
-        
+
         # Save uploaded file temporarily
         temp_filename = f"temp_{uuid.uuid4()}_{file.filename}"
         with open(temp_filename, "wb") as buffer:
@@ -129,7 +143,7 @@ async def upload_subtitle(
 
         # Parse subtitle file
         subtitles = subtitle_generator.parse_subtitle_file(temp_filename)
-        
+
         # Extract keywords
         keywords = subtitle_generator.extract_keywords(subtitles)
 
@@ -153,7 +167,7 @@ async def upload_subtitle(
 async def process_audio_with_subtitles(
     file: UploadFile = File(...),
     language: str = Form("en"),
-    model_size: str = Form("small")
+    model_size: str = Form("tiny.en")
 ):
     """
     Process audio file, generate subtitles, and extract keywords
@@ -165,7 +179,7 @@ async def process_audio_with_subtitles(
                 "data": {},
                 "message": "Audio processor service is not available"
             }
-        
+
         # Save uploaded file temporarily
         temp_filename = f"temp_{uuid.uuid4()}_{file.filename}"
         with open(temp_filename, "wb") as buffer:

@@ -8,7 +8,7 @@ class SubtitleProcessor:
         # Initialize with a default model - will be loaded on demand
         self.models = {}
 
-    def generate_subtitles(self, audio_path: str, language: str = "en", model_size: str = "small") -> List[Dict[str, Any]]:
+    def generate_subtitles(self, audio_path: str, language: str = "en", model_size: str = "medium.en") -> List[Dict[str, Any]]:
         """
         Generate subtitles for audio file
         """
@@ -40,7 +40,7 @@ class SubtitleProcessor:
         except Exception as e:
             raise Exception(f"Error generating subtitles: {str(e)}")
 
-    def generate_srt_subtitles(self, audio_path: str, output_path: str, language: str = "en", model_size: str = "small"):
+    def generate_srt_subtitles(self, audio_path: str, output_path: str, language: str = "en", model_size: str = "medium.en"):
         """
         Generate SRT subtitle file
         """

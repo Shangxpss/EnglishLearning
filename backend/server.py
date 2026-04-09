@@ -1,6 +1,6 @@
 import uvicorn
 import os
-from AI.EnglishLearning.backend.app.main import app
+from app.main import app  # noqa: F401
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
