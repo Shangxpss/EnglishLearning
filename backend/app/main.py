@@ -21,8 +21,8 @@ except ImportError:
     audio_processor = None
 
 try:
-    from .services.subtitle_generator import SubtitleGenerator
-    subtitle_generator = SubtitleGenerator()
+    from .services.subtitle_processor import SubtitleProcessor
+    subtitle_generator = SubtitleProcessor()
 except ImportError:
     subtitle_generator = None
 
@@ -147,3 +147,47 @@ async def upload_subtitle(
             words=[],
             message=f"Error processing subtitle: {str(e)}"
         )
+
+
+@app.post("/process-audio-with-subtitles/")
+async def process_audio_with_subtitles(
+    file: UploadFile = File(...),
+    language: str = Form("en"),
+    model_size: str = Form("small")
+):
+    """
+    Process audio file, generate subtitles, and extract keywords
+    """
+    try:
+        if not audio_processor:
+            return {
+                "success": False,
+                "data": {},
+                "message": "Audio processor service is not available"
+            }
+        
+        # Save uploaded file temporarily
+        temp_filename = f"temp_{uuid.uuid4()}_{file.filename}"
+        with open(temp_filename, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+
+        # Process audio with subtitles
+        result = audio_processor.process_audio_with_subtitles(
+            temp_filename, language, model_size
+        )
+
+        # Clean up temporary file
+        os.remove(temp_filename)
+
+        return {
+            "success": True,
+            "data": result,
+            "message": "Audio processed successfully with subtitles"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "data": {},
+            "message": f"Error processing audio: {str(e)}"
+        }

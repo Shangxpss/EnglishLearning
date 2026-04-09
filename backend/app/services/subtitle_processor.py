@@ -3,7 +3,7 @@ import tempfile
 from typing import List, Dict, Any
 
 
-class SubtitleGenerator:
+class SubtitleProcessor:
     def __init__(self):
         # Initialize with a default model - will be loaded on demand
         self.models = {}

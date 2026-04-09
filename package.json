@@ -6,7 +6,7 @@
     "dev": "concurrently \"pnpm run dev:web\" \"pnpm run dev:backend\"",
     "dev:web": "pnpm --filter=web dev",
     "dev:mobile": "pnpm --filter=mobile dev",
-    "dev:backend": "cd backend && uv run --active uvicorn app.main:app --reload --host 0.0.0.0 --port 8001",
+    "dev:backend": "cd backend && uv run --active uvicorn app.main:app --reload --host 0.0.0.0 --port 8003",
     "build": "pnpm --filter=web build",
     "db:up": "docker-compose up -d",
     "db:down": "docker-compose down",

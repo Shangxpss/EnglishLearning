@@ -3,13 +3,49 @@ import numpy as np
 import subprocess
 import tempfile
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List
 import av
 
 
 class AudioProcessor:
     def __init__(self):
         pass
+
+    def process_audio_with_subtitles(self, audio_path: str, language: str = "en", model_size: str = "small") -> Dict[str, Any]:
+        """
+        Process audio file, generate subtitles, and extract keywords
+        """
+        try:
+            from .subtitle_processor import SubtitleProcessor
+            subtitle_processor = SubtitleProcessor()
+
+            # Generate subtitles
+            try:
+                subtitles = subtitle_processor.generate_subtitles(
+                    audio_path, language, model_size)
+            except Exception as subtitle_error:
+                # If subtitle generation fails (e.g., model download timeout), return audio analysis only
+                audio_analysis = self.analyze_audio(audio_path)
+                return {
+                    "audio_analysis": audio_analysis,
+                    "subtitles": [],
+                    "keywords": [],
+                    "warning": f"Subtitle generation failed: {str(subtitle_error)}"
+                }
+
+            # Extract keywords
+            keywords = subtitle_processor.extract_keywords(subtitles)
+
+            # Analyze audio
+            audio_analysis = self.analyze_audio(audio_path)
+
+            return {
+                "audio_analysis": audio_analysis,
+                "subtitles": subtitles,
+                "keywords": keywords
+            }
+        except Exception as e:
+            raise Exception(f"Error processing audio with subtitles: {str(e)}")
 
     def analyze_audio(self, audio_path: str) -> Dict[str, Any]:
         """
@@ -22,6 +58,9 @@ class AudioProcessor:
             # Calculate audio metrics
             duration = librosa.get_duration(y=y, sr=sr)
             tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            # Handle case where tempo is an array
+            if isinstance(tempo, np.ndarray):
+                tempo = float(np.mean(tempo))
 
             # Extract features for English learning
             mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mels=13)
@@ -81,21 +120,21 @@ class AudioProcessor:
         try:
             container = av.open(video_path)
             stream = next(s for s in container.streams if s.type == 'audio')
-            
+
             with av.open(audio_path, 'w') as output:
                 output_stream = output.add_stream('pcm_s16le', rate=16000)
                 output_stream.channel_layout = 'mono'
-                
+
                 for packet in container.demux(stream):
                     for frame in packet.decode():
                         frame.pts = None
                         for packet in output_stream.encode(frame):
                             output.mux(packet)
-                
+
                 # Flush the encoder
                 for packet in output_stream.encode():
                     output.mux(packet)
-            
+
             return True
         except Exception as e:
             raise Exception(f"Error extracting audio from video: {str(e)}")
