@@ -1,6 +1,6 @@
 # English Learning App
 
-A comprehensive English learning platform with a monorepo architecture featuring a FastAPI backend, React Native mobile app, and shared components.
+A comprehensive English learning platform with a monorepo architecture featuring a FastAPI backend, React Native mobile app, React web application, and shared components.
 
 ## Project Structure
 
@@ -17,14 +17,47 @@ english-learning-app/
 ├── frontend/
 │   ├── mobile/                # React Native mobile app (Expo)
 │   │   └── package.json
-│   ├── shared/                # Shared TypeScript components
+│   ├── shared/                # Shared TypeScript components & types
+│   │   ├── src/
+│   │   │   ├── components/    # Reusable UI components
+│   │   │   ├── hooks/         # Custom React hooks
+│   │   │   ├── types/         # Shared TypeScript types
+│   │   │   └── index.ts       # Package entry point
 │   │   └── package.json
-│   └── web/                   # Web application (placeholder)
+│   └── web/                   # React web application (Vite + TypeScript)
+│       ├── src/
+│       │   ├── assets/        # Static assets (images, fonts)
+│       │   ├── components/    # Web-specific UI components
+│       │   │   └── ui/        # shadcn/ui components
+│       │   ├── features/      # Feature-based modules
+│       │   │   ├── home.tsx   # Home page feature
+│       │   │   ├── subtitle.tsx # Subtitle processing feature
+│       │   │   └── progress.tsx # Progress tracking feature
+│       │   ├── layout/        # Layout components
+│       │   │   └── app-shell.tsx # Main app shell layout
+│       │   ├── lib/           # Utility functions
+│       │   │   └── utils.ts   # Helper utilities (cn, etc.)
+│       │   ├── providers/     # Context providers
+│       │   │   ├── index.tsx  # Provider exports
+│       │   │   └── auth-context.tsx # Authentication context
+│       │   ├── router/        # Routing configuration
+│       │   │   ├── routes.tsx # Route definitions
+│       │   │   └── navigation.tsx # Navigation components
+│       │   ├── App.tsx        # Root application component
+│       │   ├── main.tsx       # Application entry point
+│       │   └── index.css      # Global styles (Tailwind)
+│       ├── public/            # Public static files
+│       ├── index.html         # HTML template
+│       ├── vite.config.ts     # Vite configuration
+│       ├── tailwind.config.ts # Tailwind CSS configuration
+│       ├── components.json    # shadcn/ui configuration
+│       └── package.json
 ├── product/                   # Product documentation
-│   ├── features/
-│   └── roadmap.md
+│   ├── features/              # Feature specifications
+│   └── roadmap.md             # Product roadmap
 ├── material/                  # Learning materials
-│   └── subtitle/
+│   ├── audio/                 # Audio files
+│   └── subtitle/              # Subtitle files
 ├── package.json               # Root package.json with workspace scripts
 ├── pnpm-workspace.yaml        # PNPM workspace configuration
 └── README.md                  # This file
@@ -32,18 +65,34 @@ english-learning-app/
 
 ## Tech Stack
 
-### Frontend
+### Frontend Web
 - **React** 19.2.4 - UI library
+- **React Router** 7.14.0 - Client-side routing
+- **TypeScript** ~5.9.3 - Type safety
+- **Vite** 8.0.1 - Build tool and dev server
+- **Tailwind CSS** 4.2.2 - Utility-first styling
+- **shadcn/ui** - UI component library built on Radix UI
+- **Radix UI** 1.4.3 - Accessible UI primitives
+- **TanStack Query** 5.96.2 - Data fetching and caching
+- **Lucide React** 1.7.0 - Icon library
+- **next-themes** 0.4.6 - Theme management (dark/light mode)
+- **PNPM** - Package manager with workspace support
+
+### Frontend Mobile
 - **React Native** 0.81.5 - Mobile development
 - **Expo** ~54.0.33 - Mobile development framework
 - **TypeScript** ~5.9.3 - Type safety
-- **PNPM** - Package manager with workspace support
+
+### Shared Components
+- **React** 19.2.4 (peer dependency)
+- **TypeScript** ~5.9.3
 
 ### Backend
 - **Python** >=3.11 - Runtime
 - **FastAPI** >=0.135.3 - Web framework
 - **Faster-Whisper** >=1.2.1 - Speech-to-text engine
 - **Librosa** >=0.10.0 - Audio analysis
+- **LangChain** >=0.1.0 - LLM integration
 - **UV** - Python package manager
 - **Uvicorn** >=0.29.0 - ASGI server
 
@@ -59,6 +108,21 @@ english-learning-app/
 | @types/react-dom | ^19.2.3 |
 | typescript | ~5.9.3 |
 | concurrently (dev) | ^8.2.0 |
+
+### Web Application (`frontend/web/package.json`)
+| Package | Version |
+|---------|---------|
+| react | ^19.2.4 |
+| react-dom | ^19.2.4 |
+| react-router-dom | ^7.14.0 |
+| @tanstack/react-query | ^5.96.2 |
+| radix-ui | ^1.4.3 |
+| lucide-react | ^1.7.0 |
+| tailwindcss | ^4.2.2 |
+| vite | ^8.0.1 |
+| typescript | ~5.9.3 |
+| shadcn | ^4.1.2 |
+| next-themes | ^0.4.6 |
 
 ### Mobile App (`frontend/mobile/package.json`)
 | Package | Version |
@@ -243,9 +307,50 @@ Once the backend is running, visit:
 
 The application follows a monorepo structure with:
 - **Backend**: FastAPI service handling audio processing and AI-powered transcription
+- **Frontend Web**: React web application built with Vite, TypeScript, Tailwind CSS, and shadcn/ui components
+  - Feature-based organization (`src/features/`)
+  - AppShell layout pattern for consistent UI structure
+  - React Router for client-side navigation
+  - TanStack Query for server state management
+  - Authentication context provider
 - **Frontend Mobile**: React Native app built with Expo
-- **Shared**: Common TypeScript utilities and components
+- **Shared**: Common TypeScript utilities, components, hooks, and types shared across web and mobile
 - **Product**: Feature specifications and roadmap documentation
+
+### Web Application Architecture
+
+The web frontend uses a modern component-based architecture:
+
+```
+src/
+├── main.tsx              # Entry point - mounts React app
+├── App.tsx               # Root component with providers
+├── index.css             # Global styles (Tailwind)
+├── features/             # Feature modules (business logic)
+│   ├── home.tsx          # Home page
+│   ├── subtitle.tsx      # Subtitle processing feature
+│   └── progress.tsx      # Progress tracking feature
+├── components/           # Reusable UI components
+│   └── ui/               # shadcn/ui primitive components
+├── layout/               # Layout components
+│   └── app-shell.tsx     # Main application shell
+├── router/               # Routing configuration
+│   ├── routes.tsx        # Route definitions
+│   └── navigation.tsx    # Navigation components
+├── providers/            # React context providers
+│   ├── index.tsx         # Provider exports
+│   └── auth-context.tsx  # Authentication state
+├── lib/                  # Utility functions
+│   └── utils.ts          # Helper utilities (cn, etc.)
+└── assets/               # Static assets
+```
+
+**Key Design Patterns:**
+- **Feature-based organization**: Each feature contains its own components, hooks, and logic
+- **AppShell layout**: Consistent header, sidebar, and content area structure
+- **Context providers**: Centralized state management for auth and themes
+- **shadcn/ui components**: Accessible, customizable UI primitives built on Radix UI
+- **Tailwind CSS**: Utility-first styling with dark mode support
 
 ## Contributing
 
