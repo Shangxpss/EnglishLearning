@@ -3,6 +3,8 @@ import { AppShell } from '@/layout/app-shell';
 import { HomePage } from '@/features/home';
 import { SubtitlePage } from '@/features/subtitle';
 import { ProgressPage } from '@/features/progress';
+import { LoginPage } from '@/features/auth/login';
+import { SignupPage } from '@/features/auth/signup';
 
 export const routes: RouteObject[] = [
   {
@@ -13,5 +15,13 @@ export const routes: RouteObject[] = [
       { path: 'subtitle', element: <SubtitlePage /> },
       { path: 'progress', element: <ProgressPage /> },
     ],
+  },
+  {
+    path: '/login',
+    element: <LoginPage />,
+  },
+  {
+    path: '/signup',
+    element: <SignupPage />,
   },
 ];

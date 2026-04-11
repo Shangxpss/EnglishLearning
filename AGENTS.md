@@ -1,179 +1,153 @@
-# Agents Documentation
+# Agents — Developer & CLI Guide
 
-This document provides an overview of the agents (services) used in the English Learning application, their functionality, and how to use them.
+This file defines the agents (backend services) used by the EnglishLearning project and provides clear templates, naming conventions, and integration patterns so a CLI code generator can scaffold new agents reliably.
 
-## Project Summary
+Goals:
+- Describe agent file layout and required functions/classes
+- Provide a minimal agent template and example for code generation
+- Explain how to register agents with FastAPI and tests structure
+- Document naming and configuration conventions for predictable scaffolding
 
-The English Learning application is a comprehensive platform for language learning through audio-visual content. It features a backend with specialized agents for audio processing and subtitle generation, paired with frontend interfaces for web and mobile devices. The project uses modern technologies including FastAPI for the backend, React for the web interface, and React Native for mobile access. Key features include audio analysis, pronunciation evaluation, subtitle generation, and progress tracking. The application follows a modular architecture with clear separation between backend services and frontend components, enabling easy extension and maintenance.
+## Project layout (important paths)
+- backend/app/ — FastAPI backend code
+  - backend/app/services/ — agent implementations (one file per agent)
+  - backend/app/api/ — routers and route registration helpers
+  - backend/app/core/ — configuration, settings, logger
+  - backend/app/models/ — pydantic models and DTOs
+- frontend/ — React / React Native apps (separate workspaces)
+- AGENTS.md — this file (generator source of truth)
 
-## Table of Contents
+When generating code, place new agent files under: backend/app/services/<agent_name>_agent.py
 
-- [Project Structure](#project-structure)
-- [Backend Agents](#backend-agents)
-  - [Audio Processor](#audio-processor)
-  - [Subtitle Generator](#subtitle-generator)
-- [Frontend Components](#frontend-components)
-  - [Web Interface](#web-interface)
-  - [Mobile Interface](#mobile-interface)
-- [Usage Instructions](#usage-instructions)
-  - [Setting Up the Backend](#setting-up-the-backend)
-  - [Setting Up the Frontend](#setting-up-the-frontend)
-  - [Running the Application](#running-the-application)
+## Agent conventions (required)
+- Filename: snake_case: <agent_name>_agent.py (e.g., audio_processor_agent.py)
+- Class: PascalCase with Agent suffix: <AgentName>Agent (e.g., AudioProcessorAgent)
+- Export: module must expose a `get_agent()` factory function that returns a singleton agent instance
+- Router registration: module-level `router` (FastAPI APIRouter) or a `register_routes(app)` function
+- Logging: use app core logger (from backend.app.core.logger import get_logger())
+- Settings: read env via backend.app.core.settings
 
-## Project Structure
+Required methods on agent class (minimal interface):
+- async def start(self) -> None: optional init (startup tasks)
+- async def stop(self) -> None: optional cleanup (shutdown tasks)
+- core processing method(s) documented via docstring (e.g., process_audio(self, audio_path: str) -> dict)
 
-```
-AI/EnglishLearning/
-├── backend/            # Backend services and API
-│   ├── app/            # Main application code
-│   │   ├── core/       # Core configuration
-│   │   ├── models/     # Data models
-│   │   ├── services/   # Agent services
-│   │   └── main.py     # FastAPI application entry point
-│   ├── audio/          # Audio files
-│   └── utils/          # Utility functions
-├── frontend/           # Frontend applications
-│   ├── web/            # React web interface
-│   ├── mobile/         # React Native mobile app
-│   └── shared/         # Shared components and types
-└── AGENTS.md           # This documentation file
-```
+Example minimal template (for generator to emit)
 
-## Backend Agents
+```python
+# backend/app/services/<agent_name>_agent.py
+from fastapi import APIRouter, Depends
+from backend.app.core.logger import get_logger
+from backend.app.core.settings import settings
 
-### Audio Processor
+logger = get_logger(__name__)
+router = APIRouter(prefix="/agents/<agent-name>")
 
-**Location:** `backend/app/services/audio_processor.py`
+class <AgentName>Agent:
+    """Agent responsibilities described here."""
+    def __init__(self):
+        pass
 
-**Functionality:**
-- Processes audio files for English learning content
-- Handles audio analysis and processing
-- Provides audio-related utilities for the application
+    async def start(self):
+        logger.info("<AgentName>Agent started")
 
-**Key Methods:**
-- `process_audio()`: Processes audio files to extract features
-- `analyze_pronunciation()`: Analyzes pronunciation quality
-- `generate_audio_features()`: Generates features from audio data
+    async def stop(self):
+        logger.info("<AgentName>Agent stopped")
 
-### Subtitle Generator
+    async def process(self, payload: dict) -> dict:
+        """Process a payload and return structured result."""
+        return {"status": "ok"}
 
-**Location:** `backend/app/services/subtitle_generator.py`
+agent = <AgentName>Agent()
 
-**Functionality:**
-- Generates subtitles for audio/video content
-- Processes subtitle files (SRT format)
-- Provides subtitle-related utilities
+@router.post("/process")
+async def process_endpoint(body: dict):
+    return await agent.process(body)
 
-**Key Methods:**
-- `generate_subtitles()`: Generates subtitles from audio
-- `parse_subtitle_file()`: Parses existing subtitle files
-- `sync_subtitles()`: Synchronizes subtitles with audio
-
-## Frontend Components
-
-### Web Interface
-
-**Location:** `frontend/web/`
-
-**Functionality:**
-- React-based web application for English learning
-- Provides user interface for interacting with the backend services
-- Includes components for progress tracking and subtitle display
-
-**Key Components:**
-- `Subtitle` component: Displays subtitles for audio content
-- `Progress` component: Tracks learning progress
-- `AppShell` layout: Main application layout
-
-### Mobile Interface
-
-**Location:** `frontend/mobile/`
-
-**Functionality:**
-- React Native mobile application for English learning
-- Provides on-the-go access to learning content
-- Synchronizes with web interface data
-
-## Usage Instructions
-
-### Setting Up the Project
-
-The project uses pnpm workspaces and provides scripts in the root package.json to simplify setup. Follow these steps:
-
-1. **Navigate to the project root:**
-   ```bash
-   cd /home/shang/Desktop/project/finally-mico-service/AI/EnglishLearning
-   ```
-
-2. **Run the setup script:**
-   ```bash
-   pnpm setup
-   ```
-   This script will:
-   - Install all frontend dependencies
-   - Sync backend dependencies using uv
-   - Start Docker containers for database services
-
-3. **Set up environment variables:**
-   - Copy `.env.example` to `.env` in the backend directory
-   - Update the environment variables as needed
-
-### Running the Application
-
-#### Run All Services Concurrently
-
-To start both the web frontend and backend together:
-
-```bash
-pnpm dev
+def get_agent():
+    return agent
 ```
 
-#### Run Individual Services
+Generator responsibilities
+- Create file with name and class following conventions
+- Add router prefix and endpoint stubs matching agent name
+- Add import to backend/app/api/__init__.py or instructions for manual registration
+- Optionally add a test skeleton at tests/agents/test_<agent_name>.py
 
-1. **Backend API:**
-   ```bash
-   pnpm dev:backend
-   ```
-   - Accessible at `http://localhost:8000`
-   - API documentation available at `http://localhost:8000/docs`
+## FastAPI integration
+Recommended pattern in backend/app/main.py (generator-friendly):
+- Import agent routers dynamically from backend.app.services
+- Expose a registration helper in backend/app/api/register_agents.py that the generator can update
 
-2. **Web Interface:**
-   ```bash
-   pnpm dev:web
-   ```
-   - Accessible at `http://localhost:5173`
+Example register helper (generator may append imports):
 
-3. **Mobile App:**
-   ```bash
-   pnpm dev:mobile
-   ```
-   - Use the Expo Go app to scan the QR code
-   - Or run on an emulator/simulator
+```python
+# backend/app/api/register_agents.py
+from fastapi import FastAPI
 
-## Agent Interaction Flow
+def register_agents(app: FastAPI, routers: list):
+    for r in routers:
+        app.include_router(r)
+```
 
-1. **User uploads or selects audio content** through the web or mobile interface
-2. **Audio Processor** analyzes the audio and extracts features
-3. **Subtitle Generator** creates subtitles for the audio content
-4. **Frontend** displays the content with subtitles and provides interactive learning features
-5. **Progress** is tracked and stored for the user
+Generator should add the new agent's router to a central list or provide a single-line import the main app imports.
 
-## Extending the Agents
+## Pydantic models & DTOs
+- Keep models in backend/app/models/
+- Generator should create request/response models for endpoints (e.g., <AgentName>Request, <AgentName>Response)
+- Import models in the agent module to keep contracts explicit
 
-To add new agents or extend existing ones:
+## Testing conventions
+- tests/agents/test_<agent_name>.py — basic unit tests
+- Tests should instantiate the agent, call core methods, and assert outputs
+- Integration tests: use TestClient against the agent router
 
-1. **Check latest documentation:** Review the most recent AGENTS.md and project documentation before setting up new packages or components to ensure compatibility and follow current best practices.
-2. **Backend agents:** Add new services in `backend/app/services/`
-3. **Frontend components:** Add new components in the appropriate frontend directory
-4. **Update this documentation** to reflect any changes
+Example test template:
 
-## Troubleshooting
+```python
+from backend.app.services.<agent_name>_agent import <AgentName>Agent
 
-- **Backend issues:** Check the server logs for error messages
-- **Frontend issues:** Check the browser console or Expo logs
-- **Audio processing issues:** Ensure audio files are in supported formats
-- **Subtitle issues:** Verify subtitle files are in valid SRT format
+async def test_process_returns_ok():
+    agent = <AgentName>Agent()
+    result = await agent.process({})
+    assert result.get("status") == "ok"
+```
 
-## Conclusion
+## CLI scaffolding commands (suggested)
+Provide these commands to generate an agent (the repository may not include them; generator tools should implement):
+- generate agent: `python scripts/generate_agent.py <agent-name> --with-router --with-tests`
+- or pnpm script for JS-based generator: `pnpm run gen:agent -- <agent-name>`
 
-The agents in this English Learning application work together to provide a comprehensive learning experience. The backend agents handle audio processing and subtitle generation, while the frontend components provide an intuitive user interface for interacting with the content. By following the usage instructions, you can set up and run the application to support English learning through audio-visual content.
+Generator behavior:
+- Ask for agent display name and description
+- Emit: service file, tests file, pydantic models file (optional), and an import line for register_agents
+- Respect existing files (do not overwrite unless --force)
+
+## Naming & style rules (for deterministic generation)
+- agent-name (CLI arg): kebab-case or snake_case accepted; generator normalizes to snake_case file and PascalCase class
+- router prefix: `/agents/<kebab-agent-name>`
+- test filename: tests/agents/test_<snake_agent_name>.py
+- model filename: backend/app/models/<snake_agent_name>_models.py
+
+## Example: Audio Processor (reference)
+- File: backend/app/services/audio_processor_agent.py
+- Class: AudioProcessorAgent
+- Router: /agents/audio-processor
+- Core method: async def analyze_pronunciation(self, audio_path: str) -> dict
+
+## Checklist for generated agents (automated verification)
+- [ ] File created at backend/app/services/<agent>_agent.py
+- [ ] Class <AgentName>Agent present and exported via get_agent()
+- [ ] APIRouter or register_routes present
+- [ ] Pydantic models created (if endpoints accept structured input)
+- [ ] Unit test skeleton exists at tests/agents/test_<agent>.py
+- [ ] README snippet or docstring describing responsibilities
+
+## Troubleshooting generator issues
+- Ensure package imports use absolute imports (backend.app.services...) so main.py can import dynamically
+- Avoid circular imports between services and core; use get_agent factories and import weak references
+
+## Extending this file
+When adding new conventions or generator flags, update this file and the generator scripts. Keep examples minimal and machine-parsable (templates should match the exact strings used here for prefix, class suffix, and factory function name).
+
+-- End of document

@@ -30,14 +30,41 @@ export function AppShell() {
           </nav>
 
           <div className="flex items-center gap-4">
-            {user && <span className="text-sm text-muted-foreground">Hi, {user.name}</span>}
-            {user && (
-              <button
-                onClick={logout}
-                className="text-sm text-destructive hover:underline focus:outline-none focus:ring-2 focus:ring-ring rounded-md px-2 py-1"
-              >
-                Logout
-              </button>
+            {user ? (
+              <>
+                <span className="text-sm text-muted-foreground">Hi, {user.name}</span>
+                <button
+                  onClick={logout}
+                  className="text-sm text-destructive hover:underline focus:outline-none focus:ring-2 focus:ring-ring rounded-md px-2 py-1"
+                >
+                  Logout
+                </button>
+              </>
+            ) : (
+              <>
+                <NavLink
+                  to="/login"
+                  className={({ isActive }) =>
+                    cn(
+                      'text-sm transition-colors hover:text-foreground/80',
+                      isActive ? 'text-foreground font-semibold' : 'text-muted-foreground'
+                    )
+                  }
+                >
+                  Login
+                </NavLink>
+                <NavLink
+                  to="/signup"
+                  className={({ isActive }) =>
+                    cn(
+                      'text-sm transition-colors hover:text-foreground/80',
+                      isActive ? 'text-foreground font-semibold' : 'text-muted-foreground'
+                    )
+                  }
+                >
+                  Signup
+                </NavLink>
+              </>
             )}
           </div>
         </div>

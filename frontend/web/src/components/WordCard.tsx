@@ -8,6 +8,7 @@ interface WordCardProps {
   onScoreChange: (index: number, score: number) => void;
   onHoverStart: (index: number, score: number) => void;
   onHoverEnd: (index: number) => void;
+  onSaveWord: (word: string, score: number) => void;
 }
 
 const getScoreLabel = (score: number | null) => {
@@ -29,7 +30,8 @@ export const WordCard: React.FC<WordCardProps> = ({
   index,
   onScoreChange,
   onHoverStart,
-  onHoverEnd
+  onHoverEnd,
+  onSaveWord
 }) => {
   return (
     <div className="p-4 border rounded-md space-y-2">
@@ -54,6 +56,13 @@ export const WordCard: React.FC<WordCardProps> = ({
           </button>
         ))}
       </div>
+      <button
+        onClick={() => score && onSaveWord(word, score)}
+        disabled={!score}
+        className="w-full mt-2 py-1 px-3 bg-blue-500 text-white rounded-md text-sm hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+      >
+        Save Word
+      </button>
     </div>
   );
 };

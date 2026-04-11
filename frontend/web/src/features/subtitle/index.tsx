@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { WordCard } from '../components/WordCard';
+import { WordCard } from '../../components/WordCard';
+import { useAuth } from '@/providers/auth-context';
 
 interface WordScore {
   word: string;
@@ -8,11 +9,15 @@ interface WordScore {
 }
 
 export function SubtitlePage() {
+  const { user } = useAuth();
   const [file, setFile] = useState<File | null>(null);
   const [words, setWords] = useState<WordScore[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadType, setUploadType] = useState<'subtitle' | 'audio'>('subtitle');
+  const [saving, setSaving] = useState<number | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveSuccess, setSaveSuccess] = useState<string | null>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -91,6 +96,52 @@ export function SubtitlePage() {
     setWords(updatedWords);
   };
 
+  const handleSaveWord = async (word: string, score: number) => {
+    if (!user) {
+      setSaveError('Please login to save words');
+      setTimeout(() => setSaveError(null), 3000);
+      return;
+    }
+
+    if (!score) {
+      setSaveError('Please rate the word before saving');
+      setTimeout(() => setSaveError(null), 3000);
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/save-word', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({
+          word,
+          score,
+          familiarity: getFamiliarity(score)
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to save word');
+      }
+
+      setSaveSuccess('Word saved successfully!');
+      setTimeout(() => setSaveSuccess(null), 3000);
+    } catch (err) {
+      setSaveError('Error saving word. Please try again.');
+      setTimeout(() => setSaveError(null), 3000);
+    }
+  };
+
+  const getFamiliarity = (score: number): string => {
+    if (score >= 4) return 'Familiar';
+    if (score >= 3) return 'Somewhat familiar';
+    if (score >= 2) return 'Unfamiliar';
+    return 'Very unfamiliar';
+  };
+
   return (
     <div className="space-y-6">
       <h1 className="text-3xl font-bold tracking-tight">📺 Subtitle Analyzer</h1>
@@ -147,6 +198,24 @@ export function SubtitlePage() {
           </div>
         )}
 
+        {saveSuccess && (
+          <div className="alert alert-success">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span>{saveSuccess}</span>
+          </div>
+        )}
+
+        {saveError && (
+          <div className="alert alert-error">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-2.342-.833-3.11 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
+            </svg>
+            <span>{saveError}</span>
+          </div>
+        )}
+
         {words.length > 0 && (
           <div className="space-y-4">
             <h2 className="text-xl font-semibold">Extracted Words</h2>
@@ -161,6 +230,7 @@ export function SubtitlePage() {
                   onScoreChange={handleScoreChange}
                   onHoverStart={handleHoverStart}
                   onHoverEnd={handleHoverEnd}
+                  onSaveWord={handleSaveWord}
                 />
               ))}
             </div>
