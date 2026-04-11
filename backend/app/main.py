@@ -3,11 +3,14 @@ from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from typing import Optional
 import os
+import logging
 import tempfile
 import subprocess
 import uuid
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from .models.response_models import SubtitleItem, SubtitleResponse, AudioAnalysisResponse, WordExtractionResponse
 from .models.auth_models import UserCreate, UserLogin, UserResponse, Token, WordSave
@@ -466,3 +469,26 @@ async def process_audio_with_subtitles(
             "data": {},
             "message": f"Error processing audio: {str(e)}"
         }
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize agents on application startup."""
+    if langchain_agent:
+        try:
+            await langchain_agent.start()
+            logger.info("LangChain agent initialized on startup")
+        except Exception as e:
+            logger.error(f"Failed to initialize LangChain agent: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup agents on application shutdown."""
+    if langchain_agent:
+        try:
+            await langchain_agent.stop()
+            logger.info("LangChain agent stopped")
+        except Exception as e:
+            logger.error(f"Error stopping LangChain agent: {e}")
+

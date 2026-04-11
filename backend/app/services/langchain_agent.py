@@ -1,41 +1,123 @@
+import os
+import logging
 from typing import List, Dict, Any
-from backend.app.core.logger import get_logger
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from backend.app.core.config import settings
 from .langchain_prompts import build_story_prompt
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
 
 class LangChainAgent:
-    """Wrapper for LangChain-based story generation.
+    """Wrapper for LangChain-based story generation using DeepSeek API.
 
-    Replace the placeholder generate_story implementation with a real LangChain
-    orchestration that uses prompt templates and client bindings.
+    This agent uses LangChain orchestration with DeepSeek's OpenAI-compatible API
+    to generate creative stories from unfamiliar words.
     """
+
     def __init__(self):
-        # Initialize LangChain client or config here (placeholder)
-        # Example: read OPENAI_API_KEY from env and configure client
-        self.client = None
+        self.llm = None
+        self.initialized = False
 
     async def start(self) -> None:
-        logger.info("LangChainAgent started")
+        """Initialize the LLM client with DeepSeek API configuration."""
+        api_key = settings.DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY")
+        base_url = settings.DEEPSEEK_BASE_URL or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+        if not api_key:
+            logger.warning("DEEPSEEK_API_KEY not configured. Story generation will use mocked responses.")
+            self.initialized = False
+            return
+
+        try:
+            self.llm = ChatOpenAI(
+                model="deepseek-chat",
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0.7,
+                max_tokens=2000,
+            )
+            self.initialized = True
+            logger.info("LangChainAgent initialized with DeepSeek API")
+        except Exception as e:
+            logger.error(f"Failed to initialize LangChainAgent: {e}")
+            self.initialized = False
 
     async def stop(self) -> None:
+        """Cleanup resources."""
+        self.llm = None
+        self.initialized = False
         logger.info("LangChainAgent stopped")
 
-    async def generate_story(self, words: List[str], tone: str = "fantastic", length: str = "short") -> Dict[str, Any]:
-        """Generate a story containing the given words.
+    async def generate_story(
+        self,
+        words: List[str],
+        tone: str = "fantastic",
+        length: str = "short"
+    ) -> Dict[str, Any]:
+        """Generate a story containing the given words using DeepSeek API.
 
-        Returns a dict: {"text": str, "tokens_used": int}
+        Args:
+            words: List of unfamiliar words to include in the story
+            tone: Story tone (fantastic, educational, humorous, etc.)
+            length: Story length (short, medium, long)
+
+        Returns:
+            Dict with 'text' (story content) and 'tokens_used' (approximate token count)
         """
         # Build prompt using templates
-        prompt = build_story_prompt(words, tone=tone, length=length)
+        prompt_text = build_story_prompt(words, tone=tone, length=length)
 
-        # Placeholder: when LangChain/OpenAI integration is added, send the prompt to the model.
-        # For now, return a simple mocked story so front-end integration can be developed and tested.
-        story = f"[MOCKED STORY based on prompt]\n{prompt}"
-        return {"text": story, "tokens_used": 0}
+        # If not initialized (no API key), return mocked response
+        if not self.initialized or not self.llm:
+            logger.warning("Using mocked story generation (API not configured)")
+            story = self._generate_mocked_story(words, tone, length)
+            return {"text": story, "tokens_used": 0}
+
+        try:
+            # Create LangChain prompt template
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", "You are a creative writing assistant. Generate engaging, educational stories for English learners."),
+                ("user", "{prompt}")
+            ])
+
+            # Create the chain
+            chain = prompt | self.llm | StrOutputParser()
+
+            # Invoke the chain
+            story = await chain.ainvoke({"prompt": prompt_text})
+
+            # Estimate token count (rough approximation)
+            tokens_used = len(story.split()) * 1.3  # Rough estimate
+
+            logger.info(f"Generated story with {len(words)} words, tone={tone}, length={length}")
+            return {"text": story, "tokens_used": int(tokens_used)}
+
+        except Exception as e:
+            logger.error(f"Error generating story: {e}")
+            # Fallback to mocked story on error
+            story = self._generate_mocked_story(words, tone, length)
+            return {"text": story, "tokens_used": 0}
+
+    def _generate_mocked_story(self, words: List[str], tone: str, length: str) -> str:
+        """Generate a mocked story for testing/fallback purposes."""
+        word_list = ", ".join(words[:5]) if words else "interesting words"
+        return f"""Once upon a time, there was a curious learner who encountered some fascinating words: {word_list}.
+
+In a {tone} adventure, these words came to life and taught valuable lessons about language and creativity. 
+The story unfolded with wonder and discovery, helping the learner understand each word in context.
+
+[Note: This is a mocked story. Configure DEEPSEEK_API_KEY to enable real AI-generated stories.]
+
+The end."""
+
 
 # Singleton instance for simple import from main
 agent = LangChainAgent()
 
-def get_agent():
+
+def get_agent() -> LangChainAgent:
+    """Factory function to get the LangChainAgent singleton."""
     return agent
