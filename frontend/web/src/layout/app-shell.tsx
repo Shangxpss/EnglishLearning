@@ -1,10 +1,39 @@
-import { Outlet, NavLink } from 'react-router';
+import { Outlet, NavLink, useNavigate, useLocation } from 'react-router';
 import { navItems } from '@/router/navigation';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/providers/auth-context';
+import { useEffect } from 'react';
 
 export function AppShell() {
-  const { user, logout } = useAuth();
+  const { user, isAuthenticated, isLoading, logout } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  // Redirect to login if not authenticated
+  useEffect(() => {
+    if (!isLoading && !isAuthenticated) {
+      // Store the intended destination
+      sessionStorage.setItem('redirect_after_login', location.pathname);
+      navigate('/login');
+    }
+  }, [isAuthenticated, isLoading, location.pathname, navigate]);
+
+  // Show loading state while checking auth
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto"></div>
+          <p className="mt-4 text-muted-foreground">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Don't render app shell if not authenticated (will redirect)
+  if (!isAuthenticated) {
+    return null;
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-background">

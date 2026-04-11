@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import JSONResponse
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm
 from typing import Optional
 import os
 import tempfile
@@ -13,7 +13,7 @@ from .models.response_models import SubtitleItem, SubtitleResponse, AudioAnalysi
 from .models.auth_models import UserCreate, UserLogin, UserResponse, Token, WordSave
 from .models.user_models import User, UserWord
 from .core.database import get_db
-from .core.auth import verify_password, get_password_hash, create_access_token, decode_token
+from .core.auth import verify_password, get_password_hash, create_access_token, decode_token, get_current_user
 
 app = FastAPI(
     title="English Learning API",
@@ -34,26 +34,45 @@ try:
 except ImportError:
     subtitle_generator = None
 
-# OAuth2 password bearer
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
-
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    """Get the current user from the token"""
-    credentials_exception = HTTPException(
-        status_code=401,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+# Protected route helper - validates token before allowing access
+async def require_auth(token: Optional[str] = None, db: Session = Depends(get_db)):
+    """Validate token and return current user or raise 401"""
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Remove 'Bearer ' prefix if present
+    if token.startswith("Bearer "):
+        token = token[7:]
+    
     payload = decode_token(token)
     if payload is None:
-        raise credentials_exception
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     user_id: int = payload.get("sub")
     if user_id is None:
-        raise credentials_exception
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
-        raise credentials_exception
+        raise HTTPException(
+            status_code=401,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     return user
 
 
@@ -111,7 +130,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
 
 
 @app.post("/save-word")
-async def save_word(word_data: WordSave, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def save_word(word_data: WordSave, current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
     """Save an unfamiliar word to the database"""
     # Check if word already exists for this user
     existing_word = db.query(UserWord).filter(
@@ -143,7 +162,7 @@ async def save_word(word_data: WordSave, current_user: User = Depends(get_curren
 
 
 @app.get("/my-words")
-async def get_my_words(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def get_my_words(current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
     """Get all words saved by the current user"""
     words = db.query(UserWord).filter(
         UserWord.user_id == current_user.id).all()
@@ -163,7 +182,7 @@ async def get_my_words(current_user: User = Depends(get_current_user), db: Sessi
 
 
 @app.get("/me")
-async def get_current_user_info(current_user: User = Depends(get_current_user)):
+async def get_current_user_info(current_user: User = Depends(require_auth)):
     """Get the current user's information"""
     return {
         "id": current_user.id,
