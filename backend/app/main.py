@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import JSONResponse
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from typing import Optional
 import os
 import tempfile
@@ -33,6 +33,15 @@ try:
     subtitle_generator = SubtitleProcessor()
 except ImportError:
     subtitle_generator = None
+
+# LangChain agent (optional)
+try:
+    from .services.langchain_agent import agent as langchain_agent
+except ImportError:
+    langchain_agent = None
+
+# OAuth2 password bearer
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
 
 # Protected route helper - validates token before allowing access
@@ -157,6 +166,78 @@ async def save_word(word_data: WordSave, current_user: User = Depends(require_au
     return {"success": True, "message": "Word saved successfully"}
 
 
+# Reading sessions endpoints
+@app.post("/reading_sessions")
+async def create_reading_session(payload: dict, current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
+    """Create a reading session for the current user. Payload: {"content": str}"""
+    content = payload.get("content", "") if isinstance(payload, dict) else ""
+    now = datetime.utcnow()
+    try:
+        from .models.reading_models import ReadingSession
+    except Exception:
+        ReadingSession = None
+
+    if ReadingSession:
+        session = ReadingSession(
+            user_id=current_user.id, content=content, started_at=now, finished_at=None)
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        return {"success": True, "reading_session_id": session.id}
+
+    return {"success": False, "message": "ReadingSession model not available"}
+
+
+@app.post("/reading_sessions/{session_id}/mark_word")
+async def mark_word(session_id: int, body: dict, current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
+    """Mark a word as unfamiliar during a reading session. Body: {"word": str, "snippet": str}"""
+    word = body.get("word") if isinstance(body, dict) else None
+    snippet = body.get("snippet", "") if isinstance(body, dict) else ""
+    now = datetime.utcnow()
+
+    if not word:
+        raise HTTPException(status_code=400, detail="word is required")
+
+    # Create or update UserWord
+    existing_word = db.query(UserWord).filter(
+        UserWord.user_id == current_user.id, UserWord.word == word).first()
+    if existing_word:
+        existing_word.updated_at = now
+    else:
+        new_word = UserWord(
+            user_id=current_user.id,
+            word=word,
+            score=0,
+            familiarity="unknown",
+            created_at=now,
+            updated_at=now
+        )
+        db.add(new_word)
+
+    # Optionally associate with reading session (if model available)
+    try:
+        from .models.reading_models import ReadingSession
+        # Could add a relation table if desired
+    except Exception:
+        pass
+
+    db.commit()
+    return {"success": True, "word": word}
+
+
+@app.get("/users/{user_id}/unfamiliar_words")
+async def get_unfamiliar_words(user_id: int, current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
+    """Return unfamiliar words for a given user id (only accessible by the user themselves)"""
+    # Only allow users to access their own data
+    if current_user.id != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You don't have permission to access this resource"
+        )
+    words = db.query(UserWord).filter(UserWord.user_id == user_id).all()
+    return {"success": True, "words": [{"id": w.id, "word": w.word, "familiarity": w.familiarity} for w in words]}
+
+
 @app.get("/my-words")
 async def get_my_words(current_user: User = Depends(require_auth), db: Session = Depends(get_db)):
     """Get all words saved by the current user"""
@@ -268,6 +349,31 @@ async def analyze_audio(
             analysis={},
             message=f"Error analyzing audio: {str(e)}"
         )
+
+
+@app.post("/stories")
+async def generate_story_endpoint(payload: dict):
+    """Endpoint to generate a story from provided words.
+
+    Expected JSON body: {"words": [str], "tone": str, "length": str}
+    """
+    try:
+        from .models.langchain_models import StoryRequest
+    except Exception:
+        StoryRequest = None
+
+    if not langchain_agent:
+        return {"success": False, "text": "LangChain agent not available", "tokens_used": 0}
+
+    # Normalize payload
+    words = payload.get("words") if isinstance(payload, dict) else []
+    tone = payload.get("tone", "fantastic") if isinstance(
+        payload, dict) else "fantastic"
+    length = payload.get("length", "short") if isinstance(
+        payload, dict) else "short"
+
+    result = await langchain_agent.generate_story(words, tone=tone, length=length)
+    return {"success": True, "text": result.get("text"), "tokens_used": result.get("tokens_used", 0)}
 
 
 @app.get("/health")
