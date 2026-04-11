@@ -44,8 +44,7 @@ export function LoginPage() {
       }
 
       const data = await response.json();
-      localStorage.setItem('token', data.access_token);
-
+      
       // Get user info
       const userResponse = await fetch('/api/me', {
         headers: {
@@ -58,13 +57,22 @@ export function LoginPage() {
       }
 
       const userData = await userResponse.json();
+      
+      // Login with token and user data (rememberMe defaults to true)
       login({
         id: userData.id,
         name: userData.username,
         email: userData.email
-      });
+      }, data.access_token, true);
 
-      navigate('/');
+      // Navigate to intended page or home
+      const redirectPath = sessionStorage.getItem('redirect_after_login');
+      if (redirectPath) {
+        sessionStorage.removeItem('redirect_after_login');
+        navigate(redirectPath);
+      } else {
+        navigate('/');
+      }
     } catch (err) {
       setError('Invalid email or password');
     } finally {
