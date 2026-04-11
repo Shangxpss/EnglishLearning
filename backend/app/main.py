@@ -36,7 +36,7 @@ except ImportError:
 
 
 # Protected route helper - validates token before allowing access
-async def require_auth(token: Optional[str] = None, db: Session = Depends(get_db)):
+async def require_auth(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     """Validate token and return current user or raise 401"""
     if not token:
         raise HTTPException(
@@ -44,11 +44,7 @@ async def require_auth(token: Optional[str] = None, db: Session = Depends(get_db
             detail="Authorization required",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    # Remove 'Bearer ' prefix if present
-    if token.startswith("Bearer "):
-        token = token[7:]
-    
+
     payload = decode_token(token)
     if payload is None:
         raise HTTPException(
@@ -56,7 +52,7 @@ async def require_auth(token: Optional[str] = None, db: Session = Depends(get_db
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     user_id: int = payload.get("sub")
     if user_id is None:
         raise HTTPException(
@@ -64,7 +60,7 @@ async def require_auth(token: Optional[str] = None, db: Session = Depends(get_db
             detail="Invalid token payload",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(
@@ -72,7 +68,7 @@ async def require_auth(token: Optional[str] = None, db: Session = Depends(get_db
             detail="User not found",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     return user
 
 
