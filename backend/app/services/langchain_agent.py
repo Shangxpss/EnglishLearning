@@ -1,11 +1,14 @@
 import os
 import logging
+import random
 from typing import List, Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from backend.app.core.config import settings
+from app.core.config import settings
 from .langchain_prompts import build_story_prompt
+
+# Updated to fix import issue
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +27,12 @@ class LangChainAgent:
     async def start(self) -> None:
         """Initialize the LLM client with DeepSeek API configuration."""
         api_key = settings.DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY")
-        base_url = settings.DEEPSEEK_BASE_URL or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        base_url = settings.DEEPSEEK_BASE_URL or os.getenv(
+            "DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
         if not api_key:
-            logger.warning("DEEPSEEK_API_KEY not configured. Story generation will use mocked responses.")
+            logger.warning(
+                "DEEPSEEK_API_KEY not configured. Story generation will use mocked responses.")
             self.initialized = False
             return
 
@@ -37,7 +42,7 @@ class LangChainAgent:
                 api_key=api_key,
                 base_url=base_url,
                 temperature=0.7,
-                max_tokens=2000,
+                max_completion_tokens=2000,
             )
             self.initialized = True
             logger.info("LangChainAgent initialized with DeepSeek API")
@@ -72,7 +77,8 @@ class LangChainAgent:
 
         # If not initialized (no API key), return mocked response
         if not self.initialized or not self.llm:
-            logger.warning("Using mocked story generation (API not configured)")
+            logger.warning(
+                "Using mocked story generation (API not configured)")
             story = self._generate_mocked_story(words, tone, length)
             return {"text": story, "tokens_used": 0}
 
@@ -92,7 +98,8 @@ class LangChainAgent:
             # Estimate token count (rough approximation)
             tokens_used = len(story.split()) * 1.3  # Rough estimate
 
-            logger.info(f"Generated story with {len(words)} words, tone={tone}, length={length}")
+            logger.info(
+                f"Generated story with {len(words)} words, tone={tone}, length={length}")
             return {"text": story, "tokens_used": int(tokens_used)}
 
         except Exception as e:
@@ -104,14 +111,40 @@ class LangChainAgent:
     def _generate_mocked_story(self, words: List[str], tone: str, length: str) -> str:
         """Generate a mocked story for testing/fallback purposes."""
         word_list = ", ".join(words[:5]) if words else "interesting words"
-        return f"""Once upon a time, there was a curious learner who encountered some fascinating words: {word_list}.
+
+        # Different story templates to create variety
+        story_templates = [
+            f"""Once upon a time, there was a curious learner who encountered some fascinating words: {word_list}.
 
 In a {tone} adventure, these words came to life and taught valuable lessons about language and creativity. 
 The story unfolded with wonder and discovery, helping the learner understand each word in context.
 
 [Note: This is a mocked story. Configure DEEPSEEK_API_KEY to enable real AI-generated stories.]
 
+The end.""",
+            f"""In a far-off land, a young explorer stumbled upon a magical book containing the words: {word_list}.
+
+Each word had a special power, and as the explorer learned their meanings, they embarked on a {tone} journey filled with excitement and learning.
+
+The explorer discovered that understanding these words opened up new worlds of possibility.
+
+[Note: This is a mocked story. Configure DEEPSEEK_API_KEY to enable real AI-generated stories.]
+
+The end.""",
+            f"""Once upon a time, in a village of words, {word_list} were the most mysterious and powerful of all.
+
+A brave young linguist set out to understand their secrets, and along the way, they experienced a {tone} adventure that changed their life.
+
+Through challenges and triumphs, the linguist learned the true power of language.
+
+[Note: This is a mocked story. Configure DEEPSEEK_API_KEY to enable real AI-generated stories.]
+
 The end."""
+        ]
+
+        # Select a random story template
+        selected_template = random.choice(story_templates)
+        return selected_template
 
 
 # Singleton instance for simple import from main

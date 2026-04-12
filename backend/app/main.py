@@ -1,22 +1,23 @@
+from .core.auth import verify_password, get_password_hash, create_access_token, decode_token, get_current_user
+from .core.database import get_db
+from .models.user_models import User, UserWord
+from .models.auth_models import UserCreate, UserLogin, UserResponse, Token, WordSave
+from .models.response_models import SubtitleItem, SubtitleResponse, AudioAnalysisResponse, WordExtractionResponse
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from typing import Optional
 import os
-import logging
 import tempfile
 import subprocess
 import uuid
+import logging
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
+# Set up logging
 logger = logging.getLogger(__name__)
 
-from .models.response_models import SubtitleItem, SubtitleResponse, AudioAnalysisResponse, WordExtractionResponse
-from .models.auth_models import UserCreate, UserLogin, UserResponse, Token, WordSave
-from .models.user_models import User, UserWord
-from .core.database import get_db
-from .core.auth import verify_password, get_password_hash, create_access_token, decode_token, get_current_user
 
 app = FastAPI(
     title="English Learning API",
@@ -40,8 +41,10 @@ except ImportError:
 # LangChain agent (optional)
 try:
     from .services.langchain_agent import agent as langchain_agent
-except ImportError:
+    logger.info("LangChain agent imported successfully")
+except ImportError as e:
     langchain_agent = None
+    logger.error(f"Failed to import LangChain agent: {e}")
 
 # OAuth2 password bearer
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
@@ -358,15 +361,35 @@ async def analyze_audio(
 async def generate_story_endpoint(payload: dict):
     """Endpoint to generate a story from provided words.
 
-    Expected JSON body: {"words": [str], "tone": str, "length": str}
+    Expected JSON body: {"words": [str], "tone": str, "length": str, "max_length": int}
     """
+    # Log the request
+    logger.info(f"Received story generation request: {payload}")
+    logger.info(f"LangChain agent is available: {langchain_agent is not None}")
+
     try:
         from .models.langchain_models import StoryRequest
-    except Exception:
+    except Exception as e:
         StoryRequest = None
+        logger.error(f"Failed to import StoryRequest: {e}")
 
     if not langchain_agent:
-        return {"success": False, "text": "LangChain agent not available", "tokens_used": 0}
+        # Mock story generation if LangChain agent is not available
+        logger.warning(
+            "Using mock story generation (LangChain agent not available)")
+        words = payload.get("words", []) if isinstance(payload, dict) else []
+        tone = payload.get("tone", "fantastic") if isinstance(
+            payload, dict) else "fantastic"
+        length = payload.get("length", "short") if isinstance(
+            payload, dict) else "short"
+        max_length = payload.get("max_length", 500) if isinstance(
+            payload, dict) else 500
+
+        mock_story = f"Once upon a time, there was a {tone} adventure with {', '.join(words[:3])} and other amazing things. It was a {length} but wonderful story!"
+        if len(mock_story) > max_length:
+            mock_story = mock_story[:max_length].rsplit(' ', 1)[0] + '...'
+        logger.info(f"Generated mock story: {mock_story}")
+        return {"success": True, "text": mock_story, "tokens_used": 0}
 
     # Normalize payload
     words = payload.get("words") if isinstance(payload, dict) else []
@@ -374,9 +397,20 @@ async def generate_story_endpoint(payload: dict):
         payload, dict) else "fantastic"
     length = payload.get("length", "short") if isinstance(
         payload, dict) else "short"
+    max_length = payload.get("max_length", 500) if isinstance(
+        payload, dict) else 500
 
+    logger.info(
+        f"Generating story with LangChain agent: words={words}, tone={tone}, length={length}")
     result = await langchain_agent.generate_story(words, tone=tone, length=length)
-    return {"success": True, "text": result.get("text"), "tokens_used": result.get("tokens_used", 0)}
+    story_text = result.get("text", "")
+
+    # Ensure the story doesn't exceed the max length
+    if len(story_text) > max_length:
+        story_text = story_text[:max_length].rsplit(' ', 1)[0] + '...'
+
+    logger.info(f"Generated story with LangChain agent: {story_text}")
+    return {"success": True, "text": story_text, "tokens_used": result.get("tokens_used", 0)}
 
 
 @app.get("/health")
@@ -474,6 +508,7 @@ async def process_audio_with_subtitles(
 @app.on_event("startup")
 async def startup_event():
     """Initialize agents on application startup."""
+    logger.info(f"LangChain agent is: {langchain_agent}")
     if langchain_agent:
         try:
             await langchain_agent.start()
@@ -491,4 +526,3 @@ async def shutdown_event():
             logger.info("LangChain agent stopped")
         except Exception as e:
             logger.error(f"Error stopping LangChain agent: {e}")
-
