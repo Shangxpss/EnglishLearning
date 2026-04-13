@@ -1,4 +1,4 @@
-# English Learning App
+# English Learning App (EnglishPro)
 
 A comprehensive English learning platform with a monorepo architecture featuring a FastAPI backend, React Native mobile app, React web application, and shared components.
 
@@ -9,13 +9,29 @@ english-learning-app/
 ├── backend/                    # Python FastAPI backend
 │   ├── app/
 │   │   ├── main.py            # FastAPI application entry point
-│   │   ├── models/            # Pydantic response models
-│   │   └── services/          # Audio processing & subtitle generation
+│   │   ├── api/               # API router registration
+│   │   ├── services/          # Business logic services
+│   │   │   ├── audio_processor.py    # Audio analysis service
+│   │   │   ├── subtitle_processor.py # Subtitle generation service
+│   │   │   ├── langchain_agent.py    # LLM-powered story generation
+│   │   │   └── langchain_prompts.py  # Prompt templates
+│   │   ├── models/            # SQLAlchemy & Pydantic models
+│   │   │   ├── user_models.py        # User & UserWord tables
+│   │   │   ├── reading_models.py     # ReadingSession table
+│   │   │   ├── auth_models.py        # Auth DTOs
+│   │   │   ├── response_models.py    # API response schemas
+│   │   │   └── langchain_models.py   # Story generation schemas
+│   │   └── core/              # Core utilities
+│   │       ├── config.py             # Environment settings
+│   │       ├── database.py           # SQLAlchemy DB connection
+│   │       └── auth.py               # JWT authentication
+│   ├── alembic/               # Database migrations
 │   ├── requirements.txt       # Python dependencies
 │   ├── pyproject.toml         # UV package manager config
 │   └── README.md              # Backend-specific documentation
 ├── frontend/
 │   ├── mobile/                # React Native mobile app (Expo)
+│   │   ├── App.tsx
 │   │   └── package.json
 │   ├── shared/                # Shared TypeScript components & types
 │   │   ├── src/
@@ -28,11 +44,15 @@ english-learning-app/
 │       ├── src/
 │       │   ├── assets/        # Static assets (images, fonts)
 │       │   ├── components/    # Web-specific UI components
-│       │   │   └── ui/        # shadcn/ui components
+│       │   │   ├── ui/        # shadcn/ui components
+│       │   │   ├── StoryViewer.tsx
+│       │   │   ├── WordCard.tsx
+│       │   │   └── WordPanel.tsx
 │       │   ├── features/      # Feature-based modules
-│       │   │   ├── home.tsx   # Home page feature
-│       │   │   ├── subtitle.tsx # Subtitle processing feature
-│       │   │   └── progress.tsx # Progress tracking feature
+│       │   │   ├── home/      # Home page feature
+│       │   │   ├── subtitle/  # Subtitle processing feature
+│       │   │   ├── progress/  # Progress tracking feature
+│       │   │   └── auth/      # Login & signup features
 │       │   ├── layout/        # Layout components
 │       │   │   └── app-shell.tsx # Main app shell layout
 │       │   ├── lib/           # Utility functions
@@ -42,15 +62,15 @@ english-learning-app/
 │       │   │   └── auth-context.tsx # Authentication context
 │       │   ├── router/        # Routing configuration
 │       │   │   ├── routes.tsx # Route definitions
-│       │   │   └── navigation.tsx # Navigation components
+│       │   │   └── navigation.tsx # Navigation helpers
+│       │   ├── pages/         # Page components
+│       │   │   └── ReadingPage.tsx
 │       │   ├── App.tsx        # Root application component
-│       │   ├── main.tsx       # Application entry point
-│       │   └── index.css      # Global styles (Tailwind)
+│       │   └── main.tsx       # Application entry point
 │       ├── public/            # Public static files
 │       ├── index.html         # HTML template
 │       ├── vite.config.ts     # Vite configuration
 │       ├── tailwind.config.ts # Tailwind CSS configuration
-│       ├── components.json    # shadcn/ui configuration
 │       └── package.json
 ├── product/                   # Product documentation
 │   ├── features/              # Feature specifications
@@ -58,6 +78,11 @@ english-learning-app/
 ├── material/                  # Learning materials
 │   ├── audio/                 # Audio files
 │   └── subtitle/              # Subtitle files
+├── scripts/                   # Utility scripts
+│   └── create_tables.py       # Database table creation script
+├── tests/                     # Test suites
+│   ├── agents/                # Agent-specific tests
+│   └── test_example.py
 ├── package.json               # Root package.json with workspace scripts
 ├── pnpm-workspace.yaml        # PNPM workspace configuration
 └── README.md                  # This file
@@ -177,14 +202,28 @@ english-learning-app/
 - **Subtitle Generation**: Create SRT format subtitles with timestamps
 - **Audio Analysis**: Analyze audio for English learning metrics (tempo, MFCC, spectral centroid, etc.)
 - **Keyword Extraction**: Extract important vocabulary from subtitles
+- **Story Generation**: Generate creative stories using LLM (DeepSeek API) for vocabulary practice
+- **User Authentication**: JWT-based authentication with signup/login endpoints
+- **Word Management**: Save and track unfamiliar words with familiarity scores
+- **Reading Sessions**: Track reading practice sessions and mark unfamiliar words
 - **RESTful API**: Well-documented API endpoints
 
 ### API Endpoints
 - `GET /` - Welcome message
 - `GET /health` - Health check
+- `POST /signup` - User registration
+- `POST /token` - Login and get access token
+- `POST /save-word` - Save unfamiliar word (protected)
+- `GET /my-words` - Get current user's saved words (protected)
+- `GET /me` - Get current user info (protected)
 - `POST /transcribe-audio/` - Transcribe audio and generate subtitles
 - `POST /analyze-audio/` - Analyze audio for learning metrics
 - `POST /upload-subtitle/` - Upload subtitle and extract keywords
+- `POST /process-audio-with-subtitles/` - Process audio, generate subtitles, and extract keywords
+- `POST /stories` - Generate story from word list using LLM
+- `POST /reading_sessions` - Create a reading session (protected)
+- `POST /reading_sessions/{session_id}/mark_word` - Mark word as unfamiliar during reading (protected)
+- `GET /users/{user_id}/unfamiliar_words` - Get user's unfamiliar words (protected)
 
 ## Getting Started
 
@@ -265,10 +304,23 @@ pnpm run clean
 
 ### Environment Variables
 
-See `backend/.env.example` for required environment variables:
-- API keys for external services
-- Database connection strings
-- Model configuration options
+Create a `.env` file in the `backend/` directory with the following variables:
+
+```bash
+# Database
+DATABASE_URL=postgresql://user:pass@localhost:5432/english_learning
+
+# JWT Authentication
+SECRET_KEY=your-secret-key-here
+
+# LLM Configuration (DeepSeek API)
+DEEPSEEK_API_KEY=your-deepseek-api-key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+
+# Optional: HuggingFace mirror for model downloads
+HF_ENDPOINT=https://hf-mirror.com
+HF_HUB_ENABLE_HF_TRANSFER=1
+```
 
 ### Network Configuration
 
