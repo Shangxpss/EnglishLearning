@@ -1,0 +1,30 @@
+{
+  "name": "english-learning-app",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"pnpm run dev:web\" \"pnpm run dev:backend\" \"pnpm run dev:runtime\"",
+    "dev:web": "pnpm --filter=web dev",
+    "dev:mobile": "pnpm --filter=mobile dev",
+    "dev:backend": "cd backend && uv run --active uvicorn app.main:app --reload --host 0.0.0.0 --port 8007",
+    "dev:runtime": "cd agent-runtime && bun run index.ts",
+    "build": "pnpm --filter=web build",
+    "db:up": "docker-compose up -d",
+    "db:down": "docker-compose down",
+    "db:logs": "docker-compose logs -f",
+    "setup": "pnpm install && cd backend && uv sync && cd .. && docker-compose up -d",
+    "clean": "rm -rf frontend/*/node_modules backend/.venv node_modules agent-runtime/node_modules"
+  },
+  "dependencies": {
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "@types/node": "^24.12.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "~5.9.3"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  },
+  "packageManager": "pnpm@11.9.0+sha512.bd682d5d03fe525ef7c9fd6780c6884d1e756ac4c9c9fe00c538782824310dcf90e3ddc4f53835f06dfaebd5085e41855e0bcbb3b60de2ac5bbab89e5036f03b"
+}

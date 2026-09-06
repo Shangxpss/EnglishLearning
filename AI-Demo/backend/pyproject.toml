@@ -1,0 +1,22 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "ag-ui-a2ui-toolkit>=0.0.1",
+    "ag-ui-langgraph>=0.0.40",
+    "copilotkit>=0.1.94",
+    "fastapi>=0.136.3",
+    "httpx>=0.28.1",
+    "langchain-deepseek>=1.1.0",
+    "langgraph>=1.1.0",
+    "python-dotenv>=1.0.0",
+    "uvicorn>=0.34.0",
+]
+
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[tool.uv.sources]
+copilotkit = { path = "../sdk-python", editable = true }

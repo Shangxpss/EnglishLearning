@@ -1,0 +1,6 @@
+packages:
+  - frontend/*
+allowBuilds:
+  '@scarf/scarf': set this to true or false
+
+# nodeLinker: hoisted

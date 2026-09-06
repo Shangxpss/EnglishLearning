@@ -1,51 +1,84 @@
-# Database files
-*.dbml
-
-# Dependencies
-node_modules/
-.venv/
-venv/
-__pycache__/
-.mypy_cache/
-.pytest_cache/
-dist/
-build/
-target/
-.gradle/
-
-# Compiled files
-*.pyc
-*.class
-*.o
-*.exe
-*.dll
-*.so
-*.a
-*.obj
-*.out
-
-# Environment
+# Environment files
 .env
+*.env
 .env.local
-*.env.*
+.env.*
+!.env.example
 
 # Editors
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# System
-.DS_Store
-Thumbs.db
+*.tmp
 
 # Logs
 *.log
 
-# Coverage
-coverage/
-htmlcov/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py~
+.Python
+venv/
+.venv/
+.venv_*/
+.env/
+.venv.bak/
+pip-log.txt
+pip-selfcheck.json
+.python-version
+.pytest_cache/
+.mypy_cache/
 .coverage
+htmlcov/
+coverage/
 
-# Temp files
-*.tmp
+# Build and distribution artifacts
+dist/
+build/
+*.egg-info/
+.eggs/
+.installed.cfg
+develop-eggs/
+*.egg
+*.tar
+
+# SQLite database files (local test artifacts)
+*.db
+*.db-shm
+*.db-wal
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Icon?
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Generated audio/video files
+*.wav
+*.mp3
+*.aac
+*.flac
+*.ogg
+
+# Keep dubbed videos and subtitles in app/subtitle/ (tracked)
+!services/EnglishLearning/backend/app/subtitle/**/*.mp4
+!services/EnglishLearning/backend/app/subtitle/**/*.srt
+
+# Legacy dubbing output dirs (still ignored)
+sync_dub/
+sync_dub_parallel/

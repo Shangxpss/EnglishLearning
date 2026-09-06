@@ -1,0 +1,18 @@
+{
+  "name": "generative-agent",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"pnpm run dev:front\" \"pnpm run dev:frontend\" \"pnpm run dev:runtime\" \"pnpm run dev:backend\"",
+    "dev:frontend": "pnpm --filter=frontend dev",
+    "dev:runtime": "cd agent-runtime && bun run index.ts",
+    "dev:backend": "cd backend && uv run python main.py",
+    "dev:front": "cd front && pnpm dev",
+    "build": "pnpm --filter=frontend build",
+    "lint": "pnpm --filter=frontend lint",
+    "setup": "pnpm install && cd backend && uv sync"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  }
+}

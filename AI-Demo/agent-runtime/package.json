@@ -1,0 +1,15 @@
+{
+  "name": "agent-runtime",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@copilotkit/runtime": "^1.59.5"
+  }
+}
