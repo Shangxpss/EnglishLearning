@@ -203,11 +203,26 @@ class WordAligner:
         audio = decode_audio(audio_path, target_sr=sr, mono=True)
         chunk_samples = len(audio) // n_chunks
 
+        # Overlap between adjacent chunks (seconds).  Each chunk extends
+        # _OVERLAP_S into both neighbours so Whisper has context at the
+        # boundaries.  After alignment, only words in the chunk's *core*
+        # (non-overlap) region are kept, so every word is aligned with
+        # surrounding context and there are no duplicates.
+        _OVERLAP_S = 1.5
+        overlap_samples = int(_OVERLAP_S * sr)
+
         for i in range(start_chunk, n_chunks):
-            chunk_start_sample = i * chunk_samples
-            chunk_end_sample = (i + 1) * chunk_samples if i < n_chunks - 1 else len(audio)
+            # Core region: the non-overlap part that "belongs" to this chunk.
+            core_start_sample = i * chunk_samples
+            core_end_sample = (i + 1) * chunk_samples if i < n_chunks - 1 else len(audio)
+
+            # Actual audio region: extend by overlap on both sides.
+            chunk_start_sample = max(0, core_start_sample - overlap_samples)
+            chunk_end_sample = min(len(audio), core_end_sample + overlap_samples)
             chunk_audio = audio[chunk_start_sample:chunk_end_sample]
             offset = chunk_start_sample / sr
+            core_start_s = core_start_sample / sr
+            core_end_s = core_end_sample / sr
 
             # Write chunk to temp wav
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -216,18 +231,24 @@ class WordAligner:
                 sf.write(temp_path, chunk_audio, sr)
                 # Align this chunk (also populates self.last_segments)
                 chunk_words = self._align_single(temp_path)
-                # Adjust word timestamps by chunk offset
+                # Adjust word timestamps by chunk offset, then keep only
+                # words in this chunk's core region (avoids duplicates and
+                # ensures boundary words were aligned with overlap context).
                 for w in chunk_words:
                     w.start += offset
                     w.end += offset
-                all_words.extend(chunk_words)
-                # Adjust segment timestamps by chunk offset and aggregate
+                    if core_start_s <= w.start < core_end_s:
+                        all_words.append(w)
+                # Adjust segment timestamps by chunk offset and aggregate.
+                # Same core-region filter to avoid duplicates.
                 for seg in self.last_segments:
-                    all_segments.append(AlignedCue(
-                        text=seg.text,
-                        start=seg.start + offset,
-                        end=seg.end + offset,
-                    ))
+                    seg_start = seg.start + offset
+                    if core_start_s <= seg_start < core_end_s:
+                        all_segments.append(AlignedCue(
+                            text=seg.text,
+                            start=seg_start,
+                            end=seg.end + offset,
+                        ))
             finally:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
@@ -272,6 +293,9 @@ class WordAligner:
             if data.get("model") != self.model_size or data.get("language") != self.language:
                 logger.info("checkpoint stale (model/language changed), re-aligning")
                 return None, 0, 0
+            if data.get("aligner_version") != 2:
+                logger.info("checkpoint stale (aligner version changed), re-aligning")
+                return None, 0, 0
             words = [Word(text=w["text"], start=w["start"], end=w["end"], score=w["score"])
                      for w in data.get("words", [])]
             return words, data.get("completed_chunks", 0), data.get("total_chunks", 0)
@@ -290,6 +314,7 @@ class WordAligner:
             "model": self.model_size,
             "language": self.language,
             "backend": self.backend,
+            "aligner_version": 2,  # bump invalidates pre-overlap checkpoints
             "completed_chunks": completed,
             "total_chunks": total,
             "words": [{"text": w.text, "start": w.start, "end": w.end, "score": w.score}

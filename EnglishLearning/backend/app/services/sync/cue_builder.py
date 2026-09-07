@@ -26,6 +26,22 @@ _SENTENCE_END = re.compile(r"[.!?]\s*$")
 # into the previous one to avoid fragments like "of code." on screen.
 _MIN_CUE_WORDS = 3
 
+# Maximum number of words in a single cue before forcing a split.  Whisper
+# often misses sentence-final punctuation in conversational or rapid speech,
+# causing multiple actual sentences to merge into one giant cue.  This cap
+# forces a flush so each cue stays a manageable, natural sentence.
+_MAX_CUE_WORDS = 20
+
+# Maximum duration (seconds) of a single cue.  If exceeded, force a split
+# even without punctuation — likely multiple sentences merged together.
+_MAX_CUE_DURATION = 12.0
+
+# Minimum inter-word silence (seconds) to treat as a sentence boundary.
+# Natural speech has ~0.3-0.7 s pauses between sentences; intra-sentence
+# pauses are typically <0.2 s.  0.5 s is a good balance: catches real
+# sentence boundaries without splitting mid-sentence breathing gaps.
+_SENTENCE_PAUSE_THRESHOLD = 0.5
+
 
 def build_aligned_cues(words: List[Word], total_duration: float) -> List[AlignedCue]:
     """Group words into sentences, preserving word-level alignment.
@@ -61,6 +77,33 @@ def build_aligned_cues(words: List[Word], total_duration: float) -> List[Aligned
         current_words.append(w)
         if _SENTENCE_END.search(w.text):
             flush()
+            continue
+
+        # Force-split cues that have grown too long — Whisper often misses
+        # sentence-final punctuation in conversational/rapid speech, causing
+        # multiple actual sentences to merge into one giant cue.
+        if len(current_words) >= _MAX_CUE_WORDS:
+            flush()
+            continue
+
+        # Detect sentence boundaries via inter-word silence.  Natural speech
+        # has clear pauses between sentences; if the gap before the current
+        # word exceeds the threshold, treat it as a boundary even without
+        # punctuation.  The current word starts a new sentence.
+        if len(current_words) >= 2:
+            gap = w.start - current_words[-2].end
+            if gap >= _SENTENCE_PAUSE_THRESHOLD:
+                current_words.pop()
+                flush()
+                current_words.append(w)
+                continue
+
+        # Force-split if the cue's spoken duration exceeds the cap.
+        if len(current_words) >= 2:
+            cue_dur = current_words[-1].end - current_words[0].start
+            if cue_dur >= _MAX_CUE_DURATION:
+                flush()
+
     flush()  # trailing words with no terminal punctuation
 
     if not cues:
@@ -75,6 +118,12 @@ def build_aligned_cues(words: List[Word], total_duration: float) -> List[Aligned
     for cue in cues:
         if len(cue.words or []) < _MIN_CUE_WORDS and merged:
             prev = merged[-1]
+            # Don't merge a tiny fragment into an already-long cue —
+            # that would make an over-long cue even longer.  Keep the
+            # fragment as its own entry instead.
+            if len(prev.words or []) >= _MAX_CUE_WORDS:
+                merged.append(cue)
+                continue
             combined_words = list(prev.words or [])
 
             # Strip sentence-final punctuation from the previous cue's
