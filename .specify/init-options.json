@@ -1,10 +1,9 @@
 {
   "ai": "trae",
   "ai_skills": true,
-  "branch_numbering": "sequential",
-  "context_file": ".trae/rules/project_rules.md",
+  "feature_numbering": "sequential",
   "here": true,
   "integration": "trae",
   "script": "sh",
-  "speckit_version": "0.8.3"
+  "speckit_version": "1.0.6"
 }

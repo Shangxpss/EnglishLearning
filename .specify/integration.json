@@ -1,4 +1,15 @@
 {
+  "version": "1.0.6",
+  "integration_state_schema": 1,
+  "installed_integrations": [
+    "trae"
+  ],
+  "integration_settings": {
+    "trae": {
+      "script": "sh",
+      "invoke_separator": "-"
+    }
+  },
   "integration": "trae",
-  "version": "0.8.3"
+  "default_integration": "trae"
 }
