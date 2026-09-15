@@ -1,22 +1,17 @@
-"""PyAV-based media helpers — replaces system ffmpeg for audio decoding.
+"""Rust ffmpeg-next media helpers — replaces PyAV for audio/video processing.
 
-faster-whisper's README notes:
+The heavy lifting (FFmpeg via `ffmpeg-next`) is done in the compiled Rust
+extension `english_media_native` (see ``native/rust``). This module is a thin,
+compatibility-preserving wrapper over it so the rest of the dubbing pipeline
+keeps its existing call sites and return types.
 
-    "Unlike openai-whisper, FFmpeg does not need to be installed on the
-    system. The audio is decoded with the Python library PyAV which bundles
-    the FFmpeg libraries in its package."
-
-This module exposes that same PyAV decoding for the rest of the dubbing
-pipeline, so we no longer shell out to a system ``ffmpeg`` binary for:
+It replaces the system ``ffmpeg``/``ffprobe`` binaries and the PyAV bindings
+for:
 
   * reading media duration (replaces ``ffprobe``)
   * converting edge-tts mp3 output to wav (replaces ``ffmpeg -i mp3 ...``)
   * resampling audio to a target sample rate / mono
-
-System ``ffmpeg`` is still needed for stage 7 (muxing video + audio into
-the final .mp4) — PyAV can mux but the API is far more verbose than a
-single ``ffmpeg -c:v copy -c:a aac`` call. That one usage is documented
-in the orchestrator.
+  * muxing video + audio into the final .mp4 (``ffmpeg -c:v copy -c:a aac``)
 """
 
 from __future__ import annotations
@@ -29,35 +24,21 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _get_native() -> "object":
+    """Import the Rust extension lazily (kept importable without it)."""
+    import english_media_native
+
+    return english_media_native
+
+
 def get_media_duration(path: str) -> float:
     """Return the duration of a media file in seconds (video or audio).
 
-    Uses PyAV — no system ``ffprobe`` required. Reads the container-level
-    duration, which for MP4/MKV/MP3 is reliable.
+    Backed by the Rust ffmpeg-next extension (no system ``ffprobe``).
+    Reads the container-level duration first, then falls back to the
+    longest stream's duration.
     """
-    import av
-
-    container = av.open(path)
-    try:
-        # Container duration is in microseconds (AV_TIME_BASE = 1_000_000).
-        if container.duration is not None and container.duration > 0:
-            return float(container.duration) / 1_000_000.0
-        # Fallback: derive from the longest stream's duration.
-        best = 0.0
-        for stream in container.streams:
-            if stream.duration is None:
-                continue
-            # Stream duration is in stream's time_base units; for audio/video
-            # streams av.streams expose it as a float already in seconds via
-            # the .duration property when accessed through the container.
-            try:
-                d = float(stream.duration * stream.time_base)
-            except (TypeError, ValueError):
-                continue
-            best = max(best, d)
-        return best
-    finally:
-        container.close()
+    return float(_get_native().duration(path))
 
 
 def decode_audio(
@@ -68,12 +49,12 @@ def decode_audio(
 ) -> np.ndarray:
     """Decode any audio/video file to a 1-D float32 numpy array.
 
-    Uses PyAV's ``AudioResampler`` to convert to the target sample rate
-    and channel layout in one pass — no system ``ffmpeg`` subprocess and
-    no intermediate WAV file.
+    Backed by the Rust ffmpeg-next extension which decodes + resamples to
+    the target sample rate / channel layout in one pass (no system ``ffmpeg``
+    subprocess, no intermediate WAV).
 
     Args:
-        path: input file (any container/codec PyAV supports — mp3, mp4,
+        path: input file (any container/codec FFmpeg supports — mp3, mp4,
             m4a, wav, ogg, flac, …).
         target_sr: target sample rate in Hz.
         mono: if True, downmix to mono.
@@ -83,41 +64,13 @@ def decode_audio(
     Returns:
         ``np.ndarray`` of shape ``(N,)`` float32 in ``[-1, 1]``.
     """
-    import av
-
-    container = av.open(path)
-    try:
-        layout = "mono" if mono else "stereo"
-        resampler = av.AudioResampler(
-            format="fltp",   # 32-bit float planar — to_ndarray gives float32
-            layout=layout,
-            rate=target_sr,
-        )
-        chunks: list[np.ndarray] = []
-        total_samples = 0
-        max_samples = int(max_seconds * target_sr) if max_seconds else None
-
-        for frame in container.decode(audio=0):
-            resampled = resampler.resample(frame)
-            for rf in resampled:
-                # to_ndarray() on a planar-float frame returns shape
-                # (channels, samples); for mono that's (1, N).
-                arr = rf.to_ndarray()
-                if mono and arr.ndim > 1:
-                    arr = arr.mean(axis=0)
-                else:
-                    arr = arr.reshape(-1)
-                chunks.append(arr.astype(np.float32, copy=False))
-                total_samples += arr.shape[-1]
-                if max_samples is not None and total_samples >= max_samples:
-                    # Truncate to the requested max length.
-                    out = np.concatenate(chunks)[:max_samples]
-                    return out
-        if not chunks:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(chunks)
-    finally:
-        container.close()
+    samples = _get_native().decode_audio(
+        path,
+        target_sr=int(target_sr),
+        mono=bool(mono),
+        max_seconds=float(max_seconds) if max_seconds is not None else None,
+    )
+    return np.asarray(samples, dtype=np.float32)
 
 
 def mp3_to_wav(
@@ -126,7 +79,7 @@ def mp3_to_wav(
     target_sr: int = 24000,
     mono: bool = True,
 ) -> None:
-    """Convert an mp3 file to a wav file via PyAV (no system ffmpeg).
+    """Convert an mp3 file to a wav file via the Rust decoder (no system ffmpeg).
 
     Used by :class:`EdgeTTSBackend` to convert edge-tts's mp3 output to
     the wav format the rest of the pipeline expects.
@@ -161,7 +114,7 @@ def extract_room_tone(
     """
     try:
         audio = decode_audio(video_path, target_sr=target_sr, mono=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("extract_room_tone: decode failed: %s", e)
         return np.zeros(0, dtype=np.float32)
 
@@ -214,110 +167,24 @@ def mux_video_audio(
                -c:v copy -c:a aac -b:a 128k \\
                -map 0:v:0 -map 1:a:0 -shortest out.mp4
 
-    Uses **PyAV only** — no system ``ffmpeg`` subprocess. The video stream
-    is **remuxed** (codec setup copied via ``add_stream(template=...)``,
-    packets passed through without decode/encode, so no generational loss
-    — exactly what ``-c:v copy`` does). The audio WAV is **encoded to AAC**
-    via PyAV's ``add_stream('aac', ...)`` + ``stream.encode(frame)``.
-
-    PyAV's :meth:`Container.mux` calls ``av_interleaved_write_frame``
-    internally, which buffers packets and writes them in DTS order — so
-    feeding all video packets first, then all audio packets, produces a
-    correctly interleaved MP4. This is the recommended remuxing pattern
-    from the PyAV cookbook (see https://pyav.org/docs/stable/cookbook/basics.html#remuxing).
+    Backed by the Rust ffmpeg-next extension: the video stream is remuxed
+    (codec config copied, packets passed through without transcode — no
+    generational loss, exactly what ``-c:v copy`` does) and the audio WAV is
+    encoded to AAC. ``av_interleaved_write_frame`` renders packets in DTS
+    order, so feeding video then audio produces a correctly interleaved MP4.
 
     Args:
-        video_path: input video file (any container PyAV supports).
+        video_path: input video file (any container FFmpeg supports).
         audio_path: input WAV file (the dubbed audio track).
         output_path: output .mp4 path.
         audio_bitrate: AAC bitrate in bits/sec (default 128000 = 128 kbps).
         shortest: if True, stop encoding audio once its timestamp exceeds
             the video duration (emulates ``-shortest``).
     """
-    import av
-    import numpy as np
-    import soundfile as sf
-    from fractions import Fraction
-
-    # ── open inputs ───────────────────────────────────────────────────
-    in_container = av.open(video_path)
-    if not in_container.streams.video:
-        in_container.close()
-        raise ValueError(f"no video stream in {video_path}")
-    in_video = in_container.streams.video[0]
-
-    audio_data, sr = sf.read(audio_path)
-    if audio_data.ndim > 1:
-        audio_data = audio_data[:, 0]            # → mono
-    audio_data = audio_data.astype(np.float32)
-
-    # Emulate -shortest: clip audio to video duration.
-    if shortest:
-        video_duration = float(in_container.duration) / 1_000_000.0
-        max_samples = int(video_duration * sr)
-        if len(audio_data) > max_samples:
-            audio_data = audio_data[:max_samples]
-
-    # ── open output container + streams ───────────────────────────────
-    out_container = av.open(output_path, mode="w")
-    # Remux: copy the video stream's codec config verbatim (no transcode).
-    # In PyAV 17.x the cookbook's `add_stream(template=...)` kwarg was
-    # promoted to a dedicated method `add_stream_from_template()`. It creates
-    # a stream that carries packets through without invoking an encoder —
-    # exactly what `ffmpeg -c:v copy` does.
-    out_video = out_container.add_stream_from_template(in_video)
-    # Audio: encode WAV → AAC.
-    out_audio = out_container.add_stream("aac", rate=sr)
-    out_audio.layout = "mono"
-    out_audio.bit_rate = audio_bitrate
-
-    # ── 1. remux video packets (copy, no decode/encode) ────────────────
-    # PyAV's mux() uses av_interleaved_write_frame which buffers and
-    # reorders by DTS, so feeding all video packets first then all audio
-    # packets still yields a correctly interleaved MP4.
-    for packet in in_container.demux(in_video):
-        if packet.dts is None:
-            continue                              # skip flushing packets
-        packet.stream = out_video
-        out_container.mux(packet)
-
-    # ── 2. encode audio frames → AAC packets ──────────────────────────
-    # AAC needs frames of a fixed size (frame_size, typically 1024 samples).
-    # We chunk the WAV into frame_size blocks, set pts in audio time_base,
-    # and encode. The encoder may buffer frames and emit packets in batches.
-    frame_size = out_audio.frame_size or 1024
-    # Triangular dither before int16 quantization — eliminates correlated
-    # quantization noise (sounds like a low-level buzz on quiet passages).
-    # Adds ~1 bit of noise at -96 dB, inaudible but decorrelates the error.
-    noise = (np.random.rand(len(audio_data) + frame_size) - 0.5) * 2.0
-    noise += (np.random.rand(len(audio_data) + frame_size) - 0.5) * 2.0
-    audio_f64 = audio_data + noise[:len(audio_data)] * (1.0 / 32767.0)
-    audio_int16 = np.clip(audio_f64 * 32767.0, -32768, 32767).astype(np.int16)
-    audio_time_base = Fraction(1, sr)
-
-    for offset in range(0, len(audio_int16), frame_size):
-        chunk = audio_int16[offset:offset + frame_size]
-        if len(chunk) < frame_size:
-            # pad final partial frame with zeros so the encoder flushes
-            chunk = np.pad(chunk, (0, frame_size - len(chunk)))
-        # AudioFrame.from_ndarray on an s16 planar frame expects shape
-        # (channels, samples); for mono that's (1, N).
-        frame = av.AudioFrame.from_ndarray(
-            chunk.reshape(1, -1), format="s16", layout="mono"
-        )
-        frame.sample_rate = sr
-        frame.time_base = audio_time_base
-        frame.pts = offset                        # sample-index as pts
-        for packet in out_audio.encode(frame):
-            packet.stream = out_audio
-            out_container.mux(packet)
-
-    # Flush the audio encoder (emits any buffered packets with dts=None
-    # guard handled by encode() returning [] when truly done).
-    for packet in out_audio.encode():
-        packet.stream = out_audio
-        out_container.mux(packet)
-
-    # ── finalize ──────────────────────────────────────────────────────
-    out_container.close()
-    in_container.close()
+    _get_native().mux_video_audio(
+        video_path,
+        audio_path,
+        output_path,
+        audio_bitrate=int(audio_bitrate),
+        shortest=bool(shortest),
+    )
