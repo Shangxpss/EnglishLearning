@@ -8,7 +8,7 @@ use crate::subtitle;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
@@ -51,6 +51,7 @@ impl Handler for AppState {
             ("GET", "/app.js") => bytes_ok(APP_JS.as_bytes(), "application/javascript; charset=utf-8"),
             ("GET", "/styles.css") => bytes_ok(STYLES_CSS.as_bytes(), "text/css; charset=utf-8"),
             ("GET", "/health") => Response::text(200, "application/json", r#"{"status":"ok"}"#),
+            ("GET", "/api/sessions") => self.list_sessions(),
 
             ("POST", "/api/session") => self.create_session(req),
 
@@ -73,38 +74,51 @@ impl AppState {
             Some(p) if !p.is_empty() => media::normalize_path(p),
             _ => return Response::error(400, "media_path is required"),
         };
-        if !Path::new(&media_path).is_file() {
-            return Response::error(404, &format!("media file not found: {media_path}"));
-        }
         let subtitle_path = body
             .get("subtitle_path")
             .and_then(|v| v.as_str())
             .map(|p| media::normalize_path(p));
 
-        // Resolve media duration.
-        let media_duration = match media::probe_duration(&media_path) {
-            Ok(d) => d,
-            Err(e) => return Response::error(500, &e),
-        };
-
-        // Segmentation: v1 requires a subtitle file (the whisper.cpp
-        // transcription path is a future enhancement).
-        let subtitle_path = match subtitle_path {
-            Some(p) if Path::new(&p).is_file() => p,
-            Some(p) => return Response::error(404, &format!("subtitle file not found: {p}")),
-            None => {
-                let auto = auto_subtitle(&media_path);
-                match auto {
-                    Some(p) => p,
-                    None => return Response::error(422, "no subtitle provided; supply subtitle_path or place a .srt/.vtt next to the media"),
-                }
+        match self.build_session(&media_path, subtitle_path) {
+            Ok(session) => {
+                let body = serde_json::json!({
+                    "session_id": session.id,
+                    "media_duration": session.media_duration,
+                    "cue_count": session.cues.len(),
+                });
+                Response::text(200, "application/json; charset=utf-8", body.to_string())
             }
+            Err((status, msg)) => Response::error(status, &msg),
+        }
+    }
+
+    /// Build and register a session from a media path and optional subtitle.
+    /// Returns the session id. Errors carry an HTTP status + message.
+    pub fn build_session(
+        &self,
+        media_path: &str,
+        subtitle_path: Option<String>,
+    ) -> Result<Session, (u16, String)> {
+        let media_path = media::normalize_path(media_path);
+        if !Path::new(&media_path).is_file() {
+            return Err((404, format!("media file not found: {media_path}")));
+        }
+        let media_duration = media::probe_duration(&media_path).map_err(|e| (500, e))?;
+
+        // v1 requires a subtitle file (a whisper.cpp transcription path is a
+        // future enhancement).
+        let subtitle_path = match subtitle_path {
+            Some(p) if Path::new(&p).is_file() => media::normalize_path(&p),
+            Some(p) => return Err((404, format!("subtitle file not found: {p}"))),
+            None => match auto_subtitle(&media_path) {
+                Some(p) => p,
+                None => {
+                    return Err((422, "no subtitle provided; supply subtitle_path or place a .srt/.vtt next to the media".to_string()))
+                }
+            },
         };
 
-        let raw_cues = match subtitle::parse_subtitle(&subtitle_path) {
-            Ok(c) => c,
-            Err(e) => return Response::error(422, &e),
-        };
+        let raw_cues = subtitle::parse_subtitle(&subtitle_path).map_err(|e| (422, e))?;
         let cues = segmenter::finalize(raw_cues, media_duration, &media_path);
 
         let id = gen_id();
@@ -116,13 +130,23 @@ impl AppState {
             cues,
         };
         self.sessions.lock().unwrap().insert(id.clone(), session.clone());
+        Ok(session)
+    }
 
-        let body = serde_json::json!({
-            "session_id": session.id,
-            "media_duration": session.media_duration,
-            "cue_count": session.cues.len(),
-        });
-        Response::text(200, "application/json; charset=utf-8", body.to_string())
+    fn list_sessions(&self) -> Response {
+        let guard = self.sessions.lock().unwrap();
+        let summary: Vec<serde_json::Value> = guard
+            .values()
+            .map(|s| {
+                serde_json::json!({
+                    "session_id": s.id,
+                    "media_path": s.media_path,
+                    "media_duration": s.media_duration,
+                    "cue_count": s.cues.len(),
+                })
+            })
+            .collect();
+        Response::text(200, "application/json; charset=utf-8", serde_json::to_string(&summary).unwrap())
     }
 
     fn route_session(&self, path: &str, req: &Request) -> Response {
@@ -196,7 +220,7 @@ fn auto_subtitle(media_path: &str) -> Option<String> {
     let stem = Path::new(media_path).with_extension("");
     for ext in ["srt", "vtt"] {
         let mut p = stem.as_os_str().to_owned();
-        p.push(ext);
+        p.push(format!(".{ext}"));
         let p = p.to_string_lossy().into_owned();
         if Path::new(&p).is_file() {
             return Some(p);

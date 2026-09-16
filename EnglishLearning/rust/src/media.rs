@@ -29,6 +29,14 @@ fn ff_err(e: ffmpeg_next::Error) -> String {
     media_err(&e.to_string())
 }
 
+fn ff_input(path: &str) -> std::result::Result<ffmpeg_next::format::context::Input, ffmpeg_next::Error> {
+    format::input(&std::path::PathBuf::from(path))
+}
+
+fn ff_output(path: &str) -> std::result::Result<ffmpeg_next::format::context::Output, ffmpeg_next::Error> {
+    format::output(&std::path::PathBuf::from(path))
+}
+
 fn init() -> Result<()> {
     ffmpeg_next::init().map_err(ff_err)
 }
@@ -41,7 +49,7 @@ fn init() -> Result<()> {
 /// the longest stream duration).
 pub fn probe_duration(path: &str) -> Result<f64> {
     init()?;
-    let input = format::input(path).map_err(ff_err)?;
+    let input = ff_input(path).map_err(ff_err)?;
     let d = input.duration();
     if d > 0 {
         return Ok(d as f64 / 1_000_000.0);
@@ -64,7 +72,7 @@ pub fn probe_duration(path: &str) -> Result<f64> {
 /// Native sample rate of the first audio stream in a file.
 pub fn audio_sample_rate(path: &str) -> Result<u32> {
     init()?;
-    let input = format::input(path).map_err(ff_err)?;
+    let input = ff_input(path).map_err(ff_err)?;
     let stream = input
         .streams()
         .best(MediaType::Audio)
@@ -86,8 +94,7 @@ pub fn decode_to_f32(
     max_seconds: Option<f64>,
 ) -> Result<(Vec<f32>, u16)> {
     init()?;
-    let mut input = format::input(path).map_err(ff_err)?;
-
+    let mut input = ff_input(path).map_err(ff_err)?;
     let audio_stream = input
         .streams()
         .best(MediaType::Audio)
@@ -271,7 +278,7 @@ pub fn decode_segment_wav(
 ) -> Result<()> {
     let duration = (end_sec - start_sec).max(0.0);
     // Slice via the max_seconds budget, then offset into the sample stream.
-    let (mut samples, ch) = decode_to_f32(path, sample_rate, true, None)?;
+    let (samples, ch) = decode_to_f32(path, sample_rate, true, None)?;
     let sr = sample_rate as f64;
     let skip = (start_sec * sr) as usize;
     let take = (duration * sr) as usize;
@@ -299,11 +306,11 @@ pub fn mux_video_audio(
 ) -> Result<()> {
     init()?;
 
-    let mut ictx = format::input(video_path).map_err(ff_err)?;
+    let mut ictx = ff_input(video_path).map_err(ff_err)?;
     let vstream = ictx
         .streams()
         .best(MediaType::Video)
-        .ok_or_else(|| media_err(format!("no video stream in {video_path}")))?;
+        .ok_or_else(|| media_err(&format!("no video stream in {video_path}")))?;
     let vstream_index = vstream.index();
     let vstream_time_base = vstream.time_base();
     let container_duration_us = ictx.duration();
@@ -318,7 +325,7 @@ pub fn mux_video_audio(
         }
     }
 
-    let mut octx = format::output(output_path).map_err(ff_err)?;
+    let mut octx = ff_output(output_path).map_err(ff_err)?;
     let global = octx
         .format()
         .flags()

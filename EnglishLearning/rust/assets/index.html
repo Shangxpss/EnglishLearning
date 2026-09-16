@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sentence-Video Player</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>Sentence&nbsp;Player</h1>
+    <div class="header-meta" id="meta"></div>
+    <div class="controls">
+      <button id="loopBtn" class="chip" title="Replay the active sentence until disabled">Loop</button>
+      <button id="stepBtn" class="chip" title="Play through sentences while auto-highlighting">Play through</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="player-pane">
+      <video id="media" class="player" controls preload="metadata"></video>
+      <div class="now-playing" id="nowPlaying">Waiting for a session…</div>
+    </section>
+
+    <section class="list-pane">
+      <div class="list-toolbar">
+        <input id="filter" type="search" placeholder="Filter sentences…" autocomplete="off" />
+        <span class="count" id="count"></span>
+      </div>
+      <ol id="sentences" class="sentences"></ol>
+    </section>
+  </main>
+
+  <div id="error" class="error hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

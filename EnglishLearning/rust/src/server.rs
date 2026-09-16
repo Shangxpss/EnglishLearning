@@ -2,11 +2,15 @@
 //! single-user local desktop app: serves static assets, JSON, and media files
 //! with `Range` support. No tokio/hyper weight → tiny, single static binary.
 
-use crate::app::Handler;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+
+/// Application request handler (implemented by the app state).
+pub trait Handler: Send + Sync {
+    fn handle(&self, req: &Request) -> Response;
+}
 
 pub struct Response {
     pub status: u16,

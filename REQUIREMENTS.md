@@ -40,42 +40,66 @@ asset serving, and browser launching — runs **in one compiled Rust program**.
 * **One artifact to ship** — a single compiled executable per platform, easy to
   bundle and run anywhere.
 
-* **Reuses existing Rust work** — the media layer already exists as the
-  `english_media_native` crate (see
-  [`native/rust`](file:///workspace/EnglishLearning/backend/native/rust)). Its
-  `duration`, `decode_audio`, and `mux_video_audio` functions are the core of
-  this app's media I/O and are promoted/kept and reused by the binary build.
+* **Reuses existing Rust work** — the media layer first shipped as the
+  `english_media_native` PyO3 extension (see
+  [`native/rust`](file:///workspace/EnglishLearning/python/backend/native/rust)) and
+  has been promoted into a **standalone Rust app** at
+  [`rust/`](file:///workspace/EnglishLearning/rust): `probe_duration`,
+  `decode_to_f32`, `decode_segment_wav`, and `mux_video_audio` are the core of
+  this app's media I/O and are reused by the binary build.
 
 ***
+
+> **Repository layout (v1):** `/workspace/EnglishLearning` holds two engines:
+>
+> * **`python/`** — the original Python/FastAPI dubbing studio (frozen). The
+>   split kept the full Python app byte-for-byte under this folder.
+> * **`rust/`** — the new **pure-Rust** `sentence-video` crate: a single binary
+>   with an embedded SRT/VTT parser, HTTP server, and a browser UI. This is
+>   what satisfies the "Rust-only, compiled into an `.exe`" requirement below.
 
 ## 2. Current Code Baseline (what exists and can be reused)
 
 | Capability                                      | Existing location                                                                                  | Reuse plan in the Rust binary                                                                        |
 | ----------------------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Rust media layer (ffmpeg-next)                  | [`native/rust/src/lib.rs`](file:///workspace/EnglishLearning/backend/native/rust/src/lib.rs)       | Canonical media I/O: `duration`, `decode_audio`, `mux_video_audio`. Used by the binary directly.     |
-| Rust media deps (`ffmpeg-next`, PyO3)           | [`native/rust/Cargo.toml`](file:///workspace/EnglishLearning/backend/native/rust/Cargo.toml)        | Re-frame as a library (`lib` + `bin`) so the same code builds as both extension and executable.      |
-| Python wrapper over the Rust extension          | [`av_utils.py`](file:///workspace/EnglishLearning/backend/app/services/sync/av_utils.py)           | Python path is **frozen/retired**; the logic moves natively into Rust. Used only as reference.       |
-| Sentence/word data models                       | [`models.py`](file:///workspace/EnglishLearning/backend/app/services/sync/models.py)               | Port the data shapes (`Cue { index, start, end, text, words[] }`) to Rust `struct`s.                 |
-| Sentence grouping logic (reference)             | [`cue_builder.py`](file:///workspace/EnglishLearning/backend/app/services/sync/cue_builder.py)     | Port the split/merge heuristics to Rust.                                                             |
-| Subtitle pipeline (reference)                   | [`subtitle_writer.py`](file:///workspace/EnglishLearning/backend/app/services/sync/subtitle_writer.py) | Port post-processing to Rust so `.srt`/`.vtt` input needs no Python.                                |
-| FastAPI/dubbing orchestrator API (reference)    | [`dubbing.py`](file:///workspace/EnglishLearning/backend/app/api/dubbing.py)                        | HTTP endpoint patterns to mirror in the Rust server (`axum`/`hyper`).                                |
-| Sentence-list frontend                          | [`subtitle-video/index.tsx`](file:///workspace/EnglishLearning/frontend/web/src/features/subtitle-video/index.tsx) | Build/embed as static assets served by the Rust binary.                                              |
-| Word alignment / transcription (currently Python, e.g. faster-whisper/stable-ts) | [`word_aligner.py`](file:///workspace/EnglishLearning/backend/app/services/sync/word_aligner.py) | Replaced by a **Rust-native** aligner (whisper.cpp bindings) for the transcription path.             |
+| Rust media layer (ffmpeg-next)                  | [`native/rust/src/lib.rs`](file:///workspace/EnglishLearning/python/backend/native/rust/src/lib.rs)       | Canonical media I/O: `duration`, `decode_audio`, `mux_video_audio`. Used by the binary directly.     |
+| Rust media deps (`ffmpeg-next`, PyO3)           | [`native/rust/Cargo.toml`](file:///workspace/EnglishLearning/python/backend/native/rust/Cargo.toml)        | Re-frame as a library (`lib` + `bin`) so the same code builds as both extension and executable.      |
+| Python wrapper over the Rust extension          | [`av_utils.py`](file:///workspace/EnglishLearning/python/backend/app/services/sync/av_utils.py)           | Python path is **frozen/retired**; the logic moves natively into Rust. Used only as reference.       |
+| Sentence/word data models                       | [`models.py`](file:///workspace/EnglishLearning/python/backend/app/services/sync/models.py)               | Port the data shapes (`Cue { index, start, end, text, words[] }`) to Rust `struct`s.                 |
+| Sentence grouping logic (reference)             | [`cue_builder.py`](file:///workspace/EnglishLearning/python/backend/app/services/sync/cue_builder.py)     | Port the split/merge heuristics to Rust.                                                             |
+| Subtitle pipeline (reference)                   | [`subtitle_writer.py`](file:///workspace/EnglishLearning/python/backend/app/services/sync/subtitle_writer.py) | Port post-processing to Rust so `.srt`/`.vtt` input needs no Python.                                |
+| FastAPI/dubbing orchestrator API (reference)    | [`dubbing.py`](file:///workspace/EnglishLearning/python/backend/app/api/dubbing.py)                        | HTTP endpoint patterns to mirror in the Rust server (`axum`/`hyper`).                                |
+| Sentence-list frontend                          | [`subtitle-video/index.tsx`](file:///workspace/EnglishLearning/python/frontend/web/src/features/subtitle-video/index.tsx) | Build/embed as static assets served by the Rust binary.                                              |
+| Word alignment / transcription (currently Python, e.g. faster-whisper/stable-ts) | [`word_aligner.py`](file:///workspace/EnglishLearning/python/backend/app/services/sync/word_aligner.py) | Replaced by a **Rust-native** aligner (whisper.cpp bindings) for the transcription path.             |
 
 ### 2.1 Gaps to close for a Rust-only single-`.exe` build
 
-1. **No Rust `bin` target yet** — the current Rust crate is a PyO3 `cdylib`.
-   It must be restructured so the same crate ships a native `bin` (the
-   standalone app) as well as the optional Python extension.
-2. **No Rust-native alignment/transcription** — when no subtitle file is
-   supplied, alignment currently needs Python Whisper. This must move to an
-   in-process Rust model (e.g. bindings to `whisper.cpp`).
-3. **No embedded HTTP server + embedded web assets** in Rust — needs an
-   `axum`/`hyper` server with the frontend bundled (via `include_str!` /
-   `rust-embed`) rather than served by Python/FastAPI.
-4. **No "click sentence → play that slice" wiring** — the cue list is static;
-   it needs a synced `<video currentTime>` interaction in the embedded UI.
-5. **No cross-platform single-binary packaging / installer.**
+**Implemented in v1** (in [`rust/`](file:///workspace/EnglishLearning/rust)):
+
+1. ✅ **Rust `bin` target** — the crate compiles to a standalone
+   `sentence-video` executable (`cargo build --release`).
+2. ✅ **Embedded HTTP server + web assets** — a dependency-free `std::net`
+   server (`src/server.rs`) serves the embedded UI (`assets/` via
+   `include_str!`) and a JSON/Range API. (Bundled instead of `axum`/`hyper`,
+   keeping the binary ~0.6 MB and fully static.)
+3. ✅ **Native subtitle parsing** — a pure-Rust `.srt`/`.vtt` parser
+   (`src/subtitle.rs`) + segmentation (`src/segmenter.rs`).
+4. ✅ **"Click sentence → play that slice"** — the embedded UI seeks a single
+   `<video>` to the sentence and pauses at its `end`, with loop + play-through
+   modes (`assets/app.js`).
+5. ✅ **Media delivery** — browser plays the source file over HTTP `Range`
+   (`app.rs::stream_file_range`); a `/segments/<id>/audio?start=&end=`
+   endpoint decodes a WAV slice in-process.
+
+**Still open for a later release:**
+
+1. ⏳ **Rust-native alignment/transcription** — when no subtitle file is
+   supplied, v1 returns a clear error requesting `.srt`/`.vtt`. An in-process
+   model (e.g. `whisper.cpp` bindings) is the planned path for subtitle-free
+   files.
+2. ⏳ **Cross-platform single-binary packaging / installer** — the release
+   build already produces one binary per platform; signing/installer scripts
+   are out of scope for v1.
 
 ***
 
@@ -134,7 +158,7 @@ asset serving, and browser launching — runs **in one compiled Rust program**.
 
 * FR-5.1 The application is **one Rust crate** compiled to a single executable.
   Media I/O uses `ffmpeg-next` in-process. Required public functions, already
-  proven in [`lib.rs`](file:///workspace/EnglishLearning/backend/native/rust/src/lib.rs):
+  proven in [`lib.rs`](file:///workspace/EnglishLearning/python/backend/native/rust/src/lib.rs):
   * `probe(path) -> duration` (media duration, no `ffprobe`).
   * `decode_audio(path, sr, mono, max_seconds)` (decode + resample).
   * `mux_video_audio(video, audio, out, bitrate, shortest)` (remux + AAC).
