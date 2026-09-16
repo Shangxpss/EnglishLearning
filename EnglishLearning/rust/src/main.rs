@@ -25,13 +25,19 @@ fn print_usage() {
     println!(
         "sentence-video — sentence-segmented media player (pure Rust, single binary)\n\n\
          USAGE:\n\
-         \x20 sentence-video [serve] <media-file> [OPTIONS]\n\n\
-         OPTIONS:\n\
+         \x20 sentence-video [serve] <media-file> [OPTIONS]\n\
+         \x20 sentence-video replace-audio <video> <audio> <output> [--bitrate <bps>] [--full]\n\n\
+         PLAY MODE (opens default browser):\n\
          \x20   --subtitle <srt|vtt>   subtitle file next to / for the media\n\
          \x20   --no-browser           don't auto-open the browser\n\
          \x20   --host <addr>          bind address (default 127.0.0.1)\n\
-         \x20   --port <n>             bind port; 0 = OS-assigned (default)\n\
-         \x20   --help                 show this help\n\n\
+         \x20   --port <n>             bind port; 0 = OS-assigned (default)\n\n\
+         REPLACE-AUDIO (batch, replaces a video's audio with a new track):\n\
+         \x20   <video>    media file whose audio will be replaced\n\
+         \x20   <audio>    new audio track (mp3/wav/m4a/…)\n\
+         \x20   <output>   output path (e.g. out.mp4); video is copied, audio → AAC\n\
+         \x20   --bitrate  AAC bitrate in bits/sec (default 128000)\n\
+         \x20   --full     keep audio at full length (default trims to video)\n\n\
          The binary serves an embedded player at http://<host>:<port>/ and opens\n\
          it in the default browser."
     );
@@ -60,8 +66,86 @@ fn is_media_file(path: &str) -> bool {
     MEDIA_EXTS.iter().any(|e| lower.ends_with(e))
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// replace-audio subcommand
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `sentence-video replace-audio <video> <audio> <output> [--bitrate <bps>] [--full]`
+///
+/// Replaces the video's audio track with a new one, mirroring the Python
+/// version's `av_utils.mux_video_audio`:
+///   * the video stream is copied verbatim (no re-encode, no quality loss),
+///   * the new audio is decoded and re-encoded to AAC,
+///   * by default the audio is trimmed to the video length (`-shortest`).
+fn run_replace_audio(args: &[String]) {
+    let mut video_path: Option<String> = None;
+    let mut audio_path: Option<String> = None;
+    let mut output_path: Option<String> = None;
+    let mut bitrate: usize = 128_000;
+    let mut full = false; // false = trim audio to video duration (+ -shortest)
+
+    let mut i = 0;
+    let mut positional = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bitrate" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    bitrate = v.parse().unwrap_or(128_000);
+                }
+            }
+            "--full" => full = true,
+            other => match positional {
+                0 => video_path = Some(other.to_string()),
+                1 => audio_path = Some(other.to_string()),
+                2 => output_path = Some(other.to_string()),
+                _ => {}
+            },
+        }
+        if !args[i].starts_with('-') {
+            positional += 1;
+        }
+        i += 1;
+    }
+
+    if output_path.is_none() {
+        println!(
+            "sentence-video: replace-audio requires <video> <audio> <output>\n\n\
+             USAGE:\n\
+             \x20 sentence-video replace-audio <video> <audio> <output> [--bitrate <bps>] [--full]\n\n\
+             \x20 <video>    media file whose audio will be replaced\n\
+             \x20 <audio>    new audio track (mp3/wav/m4a/…)\n\
+             \x20 <output>   output path (e.g. out.mp4)\n\
+             \x20 --bitrate  AAC bitrate in bits/sec (default 128000)\n\
+             \x20 --full     keep the audio at its full length (default trims to video)."
+        );
+        std::process::exit(1);
+    }
+
+    let video = media::normalize_path(video_path.as_deref().unwrap_or(""));
+    let audio = media::normalize_path(audio_path.as_deref().unwrap_or(""));
+    let output = media::normalize_path(output_path.as_deref().unwrap());
+
+    println!("sentence-video: replacing audio of '{video}' with '{audio}' → '{output}'");
+    match media::mux_video_audio(&video, &audio, &output, bitrate, !full) {
+        Ok(()) => println!("sentence-video: done → {output}"),
+        Err(e) => {
+            eprintln!("sentence-video: failed to replace audio: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `replace-audio` is a pure batch operation — no server. Handle it before
+    // anything else so the flag parsing below never sees these arguments.
+    if args.first().map(String::as_str) == Some("replace-audio") {
+        args.remove(0);
+        run_replace_audio(&args);
+        return;
+    }
 
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
