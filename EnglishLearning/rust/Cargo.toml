@@ -1,0 +1,23 @@
+[package]
+name = "sentence-video"
+version = "0.1.0"
+edition = "2021"
+description = "Sentence-Segmented Video Player (pure Rust, single executable)"
+license = "Apache-2.0"
+default-run = "sentence-video"
+
+[[bin]]
+name = "sentence-video"
+path = "src/main.rs"
+
+[dependencies]
+# `build` statically compiles & embeds FFmpeg from source, so the produced
+# binary needs NO system FFmpeg installed on the target machine.
+ffmpeg-next = { version = "6", features = ["build"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

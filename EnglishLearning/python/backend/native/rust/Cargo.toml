@@ -1,0 +1,17 @@
+[package]
+name = "english-media-native"
+version = "0.1.0"
+edition = "2021"
+description = "Rust ffmpeg-next media helpers for the English Learning backend"
+license = "Apache-2.0"
+
+[lib]
+name = "english_media_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+ffmpeg-next = "7"
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py311"] }
+
+[profile.release]
+opt-level = 3
