@@ -91,6 +91,15 @@ asset serving, and browser launching — runs **in one compiled Rust program**.
    (`app.rs::stream_file_range`); a `/segments/<id>/audio?start=&end=`
    endpoint decodes a WAV slice in-process.
 
+6. ✅ **FFmpeg statically embedded (no system FFmpeg required)** — the
+   `ffmpeg-next` dependency enables the `build` feature, so `cargo build
+   --release` compiles FFmpeg from source and statically links it into the
+   binary. `ldd` on the built executable shows no `libavcodec`/`libavformat`
+   etc.; only base libc remains. A user needs **no** FFmpeg installed to run
+   it. (The `build` feature uses `git clone` of the FFmpeg `release/6.1`
+   branch and requires a C toolchain + `nasm`/`yasm` and network on the
+   *build* machine only.)
+
 **Still open for a later release:**
 
 1. ⏳ **Rust-native alignment/transcription** — when no subtitle file is
@@ -98,8 +107,8 @@ asset serving, and browser launching — runs **in one compiled Rust program**.
    model (e.g. `whisper.cpp` bindings) is the planned path for subtitle-free
    files.
 2. ⏳ **Cross-platform single-binary packaging / installer** — the release
-   build already produces one binary per platform; signing/installer scripts
-   are out of scope for v1.
+   build already produces one binary per platform (with FFmpeg statically
+   embedded); signing/installer scripts are out of scope for v1.
 
 ***
 
