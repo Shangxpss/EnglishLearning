@@ -13,9 +13,8 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "http://localhost:8007",
+        target: "http://localhost:8018",
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ""),
       },
       // CopilotKit runtime (Bun) — proxies /copilotkit requests to the
       // agent-runtime, which in turn forwards them to the Python LangGraph

@@ -79,6 +79,9 @@ pnpm-debug.log*
 !services/EnglishLearning/backend/app/subtitle/**/*.mp4
 !services/EnglishLearning/backend/app/subtitle/**/*.srt
 
+# Rust
+target/
+
 # Legacy dubbing output dirs (still ignored)
 sync_dub/
 sync_dub_parallel/

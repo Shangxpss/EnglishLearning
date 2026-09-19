@@ -9,7 +9,7 @@ interface WordScore {
 }
 
 export function SubtitlePage() {
-  const { user } = useAuth();
+  const { user, token } = useAuth();
   const [file, setFile] = useState<File | null>(null);
   const [words, setWords] = useState<WordScore[]>([]);
   const [loading, setLoading] = useState(false);
@@ -97,6 +97,8 @@ export function SubtitlePage() {
   };
 
   const handleSaveWord = async (word: string, score: number) => {
+    // Auth is currently disabled (see providers/auth-context.tsx), so a guest
+    // user is always present and this gate no longer blocks usage.
     if (!user) {
       setSaveError('Please login to save words');
       setTimeout(() => setSaveError(null), 3000);
@@ -114,7 +116,7 @@ export function SubtitlePage() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
           word,

@@ -1,0 +1,7 @@
+# System packages now provide everything needed (no sudo workarounds):
+#   sudo apt install nasm libclang1-14t64 libllvm14t64 libclang-common-14-dev
+# - libclang-14.so.1 + builtin headers live at the compiled-in path
+#   /usr/lib/llvm-14/... so bindgen needs no LIBCLANG_PATH / BINDGEN_EXTRA_CLANG_ARGS
+# - nasm is needed if FFmpeg is ever rebuilt from source (cargo clean)
+# - ~/git-shim + ~/ffmpeg-tarballs kept as offline fallback for FFmpeg source
+#   refetch on bad networks (only relevant after deleting rust/target)

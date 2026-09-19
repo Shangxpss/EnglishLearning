@@ -1,0 +1,13 @@
+{
+  "name": "english-learning",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "pnpm run dev:server & pnpm run dev:web & wait",
+    "dev:server": "cargo watch --workdir rust -w src -x 'run -- --no-browser --port 8018'",
+    "dev:web": "pnpm --filter web dev",
+    "build": "pnpm run build:server && pnpm run build:web",
+    "build:server": "cargo build --release --manifest-path rust/Cargo.toml",
+    "build:web": "pnpm --filter web build"
+  }
+}

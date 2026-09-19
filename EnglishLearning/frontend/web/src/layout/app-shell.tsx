@@ -2,7 +2,7 @@ import { Outlet, NavLink, useNavigate, useLocation } from 'react-router';
 import { CopilotSidebar } from '@copilotkit/react-core/v2';
 import { navItems } from '@/router/navigation';
 import { cn } from '@/lib/utils';
-import { useAuth } from '@/providers/auth-context';
+import { useAuth, AUTH_DISABLED } from '@/providers/auth-context';
 import { useEffect } from 'react';
 
 export function AppShell() {
@@ -10,8 +10,12 @@ export function AppShell() {
   const navigate = useNavigate();
   const location = useLocation();
 
-  // Redirect to login if not authenticated
+  // Redirect to login if not authenticated.
+  // AUTH BYPASS: authentication is disabled, so this guard is skipped and the
+  // app is reachable without logging in. Set AUTH_DISABLED to false in
+  // providers/auth-context.tsx to restore the redirect.
   useEffect(() => {
+    if (AUTH_DISABLED) return;
     if (!isLoading && !isAuthenticated) {
       // Store the intended destination
       sessionStorage.setItem('redirect_after_login', location.pathname);
@@ -31,8 +35,9 @@ export function AppShell() {
     );
   }
 
-  // Don't render app shell if not authenticated (will redirect)
-  if (!isAuthenticated) {
+  // Don't render app shell if not authenticated (will redirect).
+  // AUTH BYPASS: skipped while authentication is disabled.
+  if (!AUTH_DISABLED && !isAuthenticated) {
     return null;
   }
 
@@ -60,7 +65,10 @@ export function AppShell() {
           </nav>
 
           <div className="flex items-center gap-4">
-            {user ? (
+            {AUTH_DISABLED ? (
+              // AUTH BYPASS: no login screen — every visitor browses as a guest.
+              <span className="text-sm text-muted-foreground">Guest mode · no login required</span>
+            ) : user ? (
               <>
                 <span className="text-sm text-muted-foreground">Hi, {user.name}</span>
                 <button
