@@ -1,4 +1,4 @@
-import { Home, FileText, BarChart, Book, Bot, Video, Film, Wand2, type LucideIcon } from 'lucide-react';
+import { Home, Play, type LucideIcon } from 'lucide-react';
 
 export interface NavItem {
   label: string;
@@ -6,13 +6,15 @@ export interface NavItem {
   icon: LucideIcon;
 }
 
+/**
+ * Top-nav entries.
+ *
+ * Only routes backed by the Rust `sentence-video` server are listed. The
+ * remaining pages (subtitle, subtitle-video, video-dub, dubbing-studio,
+ * reading, progress, assistant) depend on the legacy Python/FastAPI backend,
+ * so they are intentionally hidden from the nav — see router/routes.tsx.
+ */
 export const navItems: NavItem[] = [
   { label: 'Home', path: '/', icon: Home },
-  { label: 'Subtitle Tool', path: '/subtitle', icon: FileText },
-  { label: 'Subtitle → Video', path: '/subtitle-video', icon: Video },
-  { label: 'Video Dubbing', path: '/video-dub', icon: Film },
-  { label: 'Dubbing Studio', path: '/dubbing-studio', icon: Wand2 },
-  { label: 'Reading', path: '/reading', icon: Book },
-  { label: 'Progress', path: '/progress', icon: BarChart },
-  { label: 'AI Assistant', path: '/assistant', icon: Bot },
+  { label: 'Player', path: '/player', icon: Play },
 ];

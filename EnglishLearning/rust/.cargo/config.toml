@@ -3,5 +3,13 @@
 # - libclang-14.so.1 + builtin headers live at the compiled-in path
 #   /usr/lib/llvm-14/... so bindgen needs no LIBCLANG_PATH / BINDGEN_EXTRA_CLANG_ARGS
 # - nasm is needed if FFmpeg is ever rebuilt from source (cargo clean)
+#
+# Prebuilt FFmpeg cache: rust/.ffmpeg-dist (static libs + headers compiled from
+# FFmpeg 6.1 source). FFMPEG_DIR makes ffmpeg-sys-next skip its git fetch
+# entirely — required on this machine (github.com unreachable). If the dir is
+# deleted, ffmpeg-sys falls back to fetching source again.
 # - ~/git-shim + ~/ffmpeg-tarballs kept as offline fallback for FFmpeg source
-#   refetch on bad networks (only relevant after deleting rust/target)
+#   refetch on bad networks (only relevant after deleting this cache)
+
+[env]
+FFMPEG_DIR = { value = "/home/shang/Desktop/project/EnglishLearning/EnglishLearning/rust/.ffmpeg-dist", relative = false }

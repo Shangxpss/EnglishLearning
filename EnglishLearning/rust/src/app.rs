@@ -1,5 +1,6 @@
 //! Application state + request routing.
 
+use crate::db::{Db, Progress, SourceKey};
 use crate::media;
 use crate::models::Session;
 use crate::segmenter;
@@ -15,16 +16,19 @@ const APP_JS: &str = include_str!("../assets/app.js");
 const STYLES_CSS: &str = include_str!("../assets/styles.css");
 
 pub struct AppState {
+    /// Hot cache of sessions; the SQLite database is the source of truth.
     sessions: Mutex<HashMap<String, Session>>,
     cache_dir: std::path::PathBuf,
+    db: Db,
 }
 
 impl AppState {
-    pub fn new(cache_dir: std::path::PathBuf) -> Self {
+    pub fn new(cache_dir: std::path::PathBuf, db: Db) -> Self {
         std::fs::create_dir_all(&cache_dir).ok();
         AppState {
             sessions: Mutex::new(HashMap::new()),
             cache_dir,
+            db,
         }
     }
 }
@@ -55,8 +59,20 @@ impl Handler for AppState {
 
             ("POST", "/api/session") => self.create_session(req),
 
-            (m, p) if m == "GET" && p.starts_with("/api/session/") => {
+            // Opens the OS file dialog on the machine running this server and
+            // returns the chosen absolute path (the browser cannot provide it).
+            ("POST", "/api/pick-file") => self.pick_file(req),
+
+            (m, p) if (m == "GET" || m == "POST") && p.starts_with("/api/session/") => {
                 self.route_session(p, req)
+            }
+
+            // SPA fallback: any other GET that is neither an API call nor a
+            // static asset is a client-side route (e.g. `/player`, `/subtitle`).
+            // Serve the embedded `index.html` so the frontend router handles it
+            // instead of the user getting a 404 on refresh/deep-link.
+            (m, p) if m == "GET" && !p.starts_with("/api/") && !has_extension(p) => {
+                bytes_ok(INDEX_HTML.as_bytes(), "text/html; charset=utf-8")
             }
 
             _ => Response::not_found(),
@@ -78,8 +94,13 @@ impl AppState {
             .get("subtitle_path")
             .and_then(|v| v.as_str())
             .map(|p| media::normalize_path(p));
+        // `?force=1` rebuilds even when a cached session exists.
+        let force = matches!(
+            req.query.get("force").map(String::as_str),
+            Some("1") | Some("true")
+        );
 
-        match self.build_session(&media_path, subtitle_path) {
+        match self.build_session(&media_path, subtitle_path, force) {
             Ok(session) => {
                 let body = serde_json::json!({
                     "session_id": session.id,
@@ -92,12 +113,44 @@ impl AppState {
         }
     }
 
+    /// `POST /api/pick-file?kind=media|subtitle`
+    ///
+    /// Opens the native OS file dialog on the server machine and returns the
+    /// chosen absolute path as `{"path": "..."}` (or `{"path": null}` when the
+    /// user cancels). Guarded against cross-origin callers so a random website
+    /// cannot drive the local dialog.
+    fn pick_file(&self, req: &Request) -> Response {
+        let origin = req.headers.get("origin").map(|s| s.as_str());
+        if !local_origin_ok(origin) {
+            return Response::error(
+                403,
+                "the file picker is only available from the same machine (loopback)",
+            );
+        }
+        let kind = req.query.get("kind").map(|s| s.as_str()).unwrap_or("media");
+        match crate::picker::pick_file(kind) {
+            Ok(Some(path)) => Response::text(
+                200,
+                "application/json; charset=utf-8",
+                serde_json::json!({ "path": path }).to_string(),
+            ),
+            Ok(None) => Response::text(200, "application/json; charset=utf-8", r#"{"path":null}"#),
+            Err(e) => Response::error(500, &e),
+        }
+    }
+
     /// Build and register a session from a media path and optional subtitle.
     /// Returns the session id. Errors carry an HTTP status + message.
+    ///
+    /// The result is persisted to SQLite and keyed by the media path plus the
+    /// media/subtitle modification times, so re-opening the same source later
+    /// returns the stored sentence list instead of re-parsing (`force` skips
+    /// the cache and rebuilds).
     pub fn build_session(
         &self,
         media_path: &str,
         subtitle_path: Option<String>,
+        force: bool,
     ) -> Result<Session, (u16, String)> {
         let media_path = media::normalize_path(media_path);
         if !Path::new(&media_path).is_file() {
@@ -118,6 +171,24 @@ impl AppState {
             },
         };
 
+        let key = SourceKey {
+            media_path: media_path.clone(),
+            media_mtime: file_mtime(&media_path),
+            subtitle_path: Some(subtitle_path.clone()),
+            subtitle_mtime: file_mtime(&subtitle_path),
+        };
+
+        // Cache hit: the same media + subtitle (unchanged) was processed before.
+        if !force {
+            if let Some(existing) = self.db.find_by_source(&key) {
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .insert(existing.id.clone(), existing.clone());
+                return Ok(existing);
+            }
+        }
+
         let raw_cues = subtitle::parse_subtitle(&subtitle_path).map_err(|e| (422, e))?;
         let cues = segmenter::finalize(raw_cues, media_duration, &media_path);
 
@@ -129,24 +200,32 @@ impl AppState {
             source_format: subtitle::detect_format(&subtitle_path).to_string(),
             cues,
         };
-        self.sessions.lock().unwrap().insert(id.clone(), session.clone());
+        self.db
+            .insert_session(&session, &key)
+            .map_err(|e| (500, format!("cannot persist session: {e}")))?;
+        self.sessions.lock().unwrap().insert(id, session.clone());
         Ok(session)
     }
 
+    /// Fetch a session from the hot cache, falling back to SQLite.
+    fn load_session(&self, id: &str) -> Option<Session> {
+        if let Some(s) = self.sessions.lock().unwrap().get(id) {
+            return Some(s.clone());
+        }
+        let session = self.db.get_session(id)?;
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), session.clone());
+        Some(session)
+    }
+
     fn list_sessions(&self) -> Response {
-        let guard = self.sessions.lock().unwrap();
-        let summary: Vec<serde_json::Value> = guard
-            .values()
-            .map(|s| {
-                serde_json::json!({
-                    "session_id": s.id,
-                    "media_path": s.media_path,
-                    "media_duration": s.media_duration,
-                    "cue_count": s.cues.len(),
-                })
-            })
-            .collect();
-        Response::text(200, "application/json; charset=utf-8", serde_json::to_string(&summary).unwrap())
+        let summary = self.db.list_sessions();
+        match serde_json::to_string(&summary) {
+            Ok(body) => Response::text(200, "application/json; charset=utf-8", body),
+            Err(e) => Response::error(500, &e.to_string()),
+        }
     }
 
     fn route_session(&self, path: &str, req: &Request) -> Response {
@@ -155,12 +234,9 @@ impl AppState {
         let id = segs.next().unwrap_or_default().to_string();
         let sub = segs.next();
 
-        let session = {
-            let guard = self.sessions.lock().unwrap();
-            match guard.get(&id) {
-                Some(s) => s.clone(),
-                None => return Response::error(404, "unknown session id"),
-            }
+        let session = match self.load_session(&id) {
+            Some(s) => s,
+            None => return Response::error(404, "unknown session id"),
         };
 
         match sub {
@@ -180,7 +256,36 @@ impl AppState {
                 let idx = segs.next().unwrap_or_default();
                 self.route_segment(&session, idx, req)
             }
+            Some("progress") => self.route_progress(&session, req),
             Some(_) => Response::not_found(),
+        }
+    }
+
+    /// `GET /api/session/{id}/progress` → `{ last_index, position }`
+    /// `POST /api/session/{id}/progress` with the same body → persists it.
+    fn route_progress(&self, session: &Session, req: &Request) -> Response {
+        match req.method.as_str() {
+            "GET" => {
+                let progress = self.db.get_progress(&session.id).unwrap_or(Progress {
+                    last_index: -1,
+                    position: 0.0,
+                });
+                match serde_json::to_string(&progress) {
+                    Ok(body) => Response::text(200, "application/json; charset=utf-8", body),
+                    Err(e) => Response::error(500, &e.to_string()),
+                }
+            }
+            "POST" => {
+                let progress: Progress = match serde_json::from_slice(&req.body) {
+                    Ok(p) => p,
+                    Err(_) => return Response::error(400, "invalid JSON body"),
+                };
+                match self.db.set_progress(&session.id, progress) {
+                    Ok(()) => Response::text(200, "application/json; charset=utf-8", r#"{"ok":true}"#),
+                    Err(e) => Response::error(500, &e),
+                }
+            }
+            _ => Response::not_found(),
         }
     }
 
@@ -214,6 +319,16 @@ impl AppState {
             Err(e) => Response::error(500, &e),
         }
     }
+}
+
+/// Modification time in whole seconds since the Unix epoch, when available.
+/// Used as part of the cache key so an edited subtitle rebuilds the session.
+fn file_mtime(path: &str) -> Option<i64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
 }
 
 fn auto_subtitle(media_path: &str) -> Option<String> {
@@ -335,4 +450,64 @@ fn parse_range(spec: &str, len: u64) -> Option<(u64, u64)> {
 
 fn bytes_ok(data: &[u8], content_type: &str) -> Response {
     Response::bytes(200, "OK", content_type, data.to_vec())
+}
+
+/// True when the last path segment looks like a static asset (contains a `.`),
+/// e.g. `/assets/index-abc.js`. Those must 404 rather than fall back to the
+/// SPA `index.html`; extension-less paths are client-side routes.
+fn has_extension(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .map(|seg| seg.contains('.'))
+        .unwrap_or(false)
+}
+
+/// True when the request may drive the native file dialog: no `Origin` at all
+/// (curl, same-origin navigation) or a loopback origin. A public website cannot
+/// read the response without CORS headers, but this also stops it from popping
+/// the dialog in the first place.
+fn local_origin_ok(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    let origin = origin.trim().to_ascii_lowercase();
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(end) = authority.strip_prefix('[') {
+        end.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spa_fallback_distinguishes_routes_from_assets() {
+        assert!(has_extension("/assets/index-abc.js"));
+        assert!(has_extension("/favicon.svg"));
+        assert!(!has_extension("/player"));
+        assert!(!has_extension("/subtitle-video"));
+        assert!(!has_extension("/"));
+    }
+
+    #[test]
+    fn file_picker_allows_only_loopback_origins() {
+        // Non-browser clients and same-origin navigations send no Origin.
+        assert!(local_origin_ok(None));
+        // Dev server (vite) and the binary itself.
+        assert!(local_origin_ok(Some("http://127.0.0.1:5173")));
+        assert!(local_origin_ok(Some("http://localhost:8018")));
+        assert!(local_origin_ok(Some("http://[::1]:8018")));
+        // A public site must not be able to open the dialog.
+        assert!(!local_origin_ok(Some("https://evil.example")));
+        assert!(!local_origin_ok(Some("http://127.0.0.1.evil.example")));
+        assert!(!local_origin_ok(Some("http://192.168.1.5:5173")));
+    }
 }

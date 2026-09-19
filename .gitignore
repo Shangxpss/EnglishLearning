@@ -81,6 +81,7 @@ pnpm-debug.log*
 
 # Rust
 target/
+.ffmpeg-dist/
 
 # Legacy dubbing output dirs (still ignored)
 sync_dub/

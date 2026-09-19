@@ -9,8 +9,10 @@
 //! added later via `POST /api/session`).
 
 mod app;
+mod db;
 mod media;
 mod models;
+mod picker;
 mod pipeline;
 mod segmenter;
 mod server;
@@ -33,7 +35,8 @@ fn print_usage() {
          \x20   --subtitle <srt|vtt>   subtitle file next to / for the media\n\
          \x20   --no-browser           don't auto-open the browser\n\
          \x20   --host <addr>          bind address (default 127.0.0.1)\n\
-         \x20   --port <n>             bind port; 0 = OS-assigned (default)\n\n\
+         \x20   --port <n>             bind port; 0 = OS-assigned (default)\n\
+         \x20   --data-dir <path>      folder for the SQLite session database\n\n\
          REPLACE-AUDIO (batch, replaces a video's audio with a supplied track):\n\
          \x20   <video>    media whose audio will be replaced\n\
          \x20   <audio>    new audio track (mp3/wav/m4a/…)\n\
@@ -252,6 +255,32 @@ fn run_dub(args: &[String]) {
     }
 }
 
+/// Where the SQLite session database lives. Priority: `--data-dir`, then the
+/// platform user-data directory, then `.sentence-video` in the working dir.
+fn resolve_data_dir(explicit: Option<String>) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(d) = explicit {
+        return PathBuf::from(media::normalize_path(&d));
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata).join("sentence-video");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Application Support/sentence-video");
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("sentence-video");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/share/sentence-video");
+    }
+    PathBuf::from(".sentence-video")
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -287,6 +316,7 @@ fn main() {
     let mut open_browser_flag = true;
     let mut host = "127.0.0.1".to_string();
     let mut port = 0;
+    let mut data_dir: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -297,6 +327,12 @@ fn main() {
                 subtitle_path = args.get(i).cloned();
             }
             "--no-browser" => open_browser_flag = false,
+            "--data-dir" => {
+                i += 1;
+                if let Some(d) = args.get(i) {
+                    data_dir = Some(d.clone());
+                }
+            }
             "--host" => {
                 i += 1;
                 if let Some(h) = args.get(i) {
@@ -321,11 +357,34 @@ fn main() {
     }
 
     let cache_dir = std::env::temp_dir().join("sentence-video-cache");
-    let state = Arc::new(app::AppState::new(cache_dir));
+    let data_dir = resolve_data_dir(data_dir);
+    let db_path = data_dir.join("sessions.db");
+    let db = match db::Db::open(&db_path) {
+        Ok(db) => {
+            println!("sentence-video: session database → {}", db_path.display());
+            db
+        }
+        Err(e) => {
+            // NFR-3: degrade gracefully — fall back to a temp database.
+            let fallback_dir = std::env::temp_dir().join("sentence-video");
+            eprintln!(
+                "sentence-video: {e}; falling back to {}",
+                fallback_dir.join("sessions.db").display()
+            );
+            match db::Db::open(&fallback_dir.join("sessions.db")) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("sentence-video: cannot open a session database: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    let state = Arc::new(app::AppState::new(cache_dir, db));
 
-    // Auto-create a session when a media file was passed in.
+    // Auto-create (or resume) a session when a media file was passed in.
     if let Some(mp) = &media_path {
-        match state.build_session(mp, subtitle_path.clone()) {
+        match state.build_session(mp, subtitle_path.clone(), false) {
             Ok(session) => {
                 println!(
                     "sentence-video: loaded '{}' ({}s, {} sentences)",

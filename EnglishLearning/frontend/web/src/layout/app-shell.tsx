@@ -1,5 +1,8 @@
 import { Outlet, NavLink, useNavigate, useLocation } from 'react-router';
-import { CopilotSidebar } from '@copilotkit/react-core/v2';
+// Hidden: the assistant sidebar talks to the Bun `/copilotkit` runtime, which
+// the Rust `sentence-video` backend does not serve. Re-enable together with
+// the /assistant route when that runtime is available again.
+// import { CopilotSidebar } from '@copilotkit/react-core/v2';
 import { navItems } from '@/router/navigation';
 import { cn } from '@/lib/utils';
 import { useAuth, AUTH_DISABLED } from '@/providers/auth-context';
@@ -112,9 +115,11 @@ export function AppShell() {
         <Outlet />
       </main>
 
-      {/* CopilotKit sidebar — makes the EnglishPro Assistant available from
-          any authenticated page. Mirrors AI-Demo/front/src/Sidebar.tsx.
-          The CopilotKitProvider is mounted at the app root (providers/index.tsx). */}
+      {/* CopilotKit sidebar — HIDDEN while the frontend targets the Rust
+          `sentence-video` backend, which has no `/copilotkit` runtime. The
+          provider stays mounted in providers/index.tsx so the /assistant route
+          still works if that runtime is started. To restore the sidebar,
+          uncomment it and its import above.
       <CopilotSidebar
         agentId="english_pro_agent"
         defaultOpen={false}
@@ -124,6 +129,7 @@ export function AppShell() {
             'Hi! I am your English tutor. Ask me to generate a story, explain a word, or review your vocabulary.',
         }}
       />
+      */}
     </div>
   );
 }
