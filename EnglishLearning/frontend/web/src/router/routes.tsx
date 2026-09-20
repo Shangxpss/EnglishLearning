@@ -20,7 +20,7 @@ export const routes: RouteObject[] = [
       { index: true, element: <HomePage /> },
 
       // ── Rust `sentence-video` backend compatible routes ──────────────────
-      // /player uses /api/sessions, /api/session, /cues, /media, /segments —
+      // /player uses /api/sessions, /api/session, /cues, /media, /audio —
       // all implemented in rust/src/app.rs.
       { path: 'player', element: <PlayerPage /> },
 

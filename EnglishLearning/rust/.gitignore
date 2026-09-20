@@ -1,0 +1,3 @@
+# Embedded speech-to-text model (~32–190 MB), fetched on demand.
+# Run `scripts/fetch-asr-model.sh` to (re)create it; `build.rs` embeds it.
+assets/models/

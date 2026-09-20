@@ -53,7 +53,7 @@ fn make_cue(index: usize, words: &[Word]) -> Cue {
 /// `cue_builder.build_aligned_cues`. Words accumulate until a sentence-final
 /// punctuation mark, too many words, or too long a span — whichever comes
 /// first. Output is sample-clamped via [`segmenter::finalize`].
-pub fn build_cues(words: &[Word], media_duration: f64) -> Vec<Cue> {
+pub fn build_cues(words: &[Word], media_duration: f64, media_path: &str) -> Vec<Cue> {
     let mut cues: Vec<Cue> = Vec::new();
     let mut current: Vec<Word> = Vec::new();
     let mut open_parens = 0i32;
@@ -105,7 +105,7 @@ pub fn build_cues(words: &[Word], media_duration: f64) -> Vec<Cue> {
         }
     }
 
-    segmenter::finalize(cues, media_duration, "")
+    segmenter::finalize(cues, media_duration, media_path)
 }
 
 /// A speech-recognition transcript: word-level timings plus the audio
@@ -117,17 +117,30 @@ pub struct Transcript {
 
 /// From-audio entry point: transcribe the media's audio into word timings.
 ///
-/// This is the natural home for a whisper.cpp binding. Until a binding is
-/// compiled in, it returns a descriptive error so the pipeline can fall back
-/// to an explicit/adjacent subtitle file.
+/// Decodes the audio to 16 kHz mono with the in-process FFmpeg layer, then runs
+/// whisper.cpp (see [`crate::asr`]). The model is embedded in the executable, so
+/// no external files are needed; `--asr-model <path>` overrides it.
 pub fn transcribe_words(media_path: &str) -> Result<Transcript, String> {
-    // TODO: bind whisper.cpp here; probe the duration with
-    // `crate::media::probe_duration(media_path)` to align word timings.
-    let _ = media_path;
-    Err("speech-to-text backend is not bound yet. Bind a whisper.cpp backend in \
-         `pipeline::transcribe::transcribe_words`, or supply a subtitle file via \
-         cues_from_media(media, Some(subtitle))."
-        .to_string())
+    let cfg = crate::asr::config();
+    transcribe_words_with(media_path, cfg.model.as_deref(), cfg.language.as_deref())
+}
+
+/// [`transcribe_words`] with an explicit model and language.
+pub fn transcribe_words_with(
+    media_path: &str,
+    model: Option<&Path>,
+    language: Option<&str>,
+) -> Result<Transcript, String> {
+    if !crate::asr::model_available(model) {
+        return Err(crate::asr::NO_MODEL_HELP.to_string());
+    }
+    let duration_secs = media::probe_duration(media_path).unwrap_or(0.0);
+    let (samples, _channels) = media::decode_to_f32(media_path, crate::asr::SAMPLE_RATE, true, None)?;
+    if samples.is_empty() {
+        return Err(format!("no audio track could be decoded from '{media_path}'"));
+    }
+    let words = crate::asr::transcribe(&samples, model, language)?;
+    Ok(Transcript { words, duration_secs })
 }
 
 /// Look for an adjacent `<media-basename>.(srt|vtt)` subtitle file.
@@ -147,10 +160,9 @@ pub fn auto_subtitle(media_path: &str) -> Option<String> {
 /// Best-effort cue source for a media file:
 ///
 /// 1. an explicitly supplied subtitle path (parsed + finalized), else
-/// 2. an adjacent `<media>.srt`/`.vtt` auto-detected next to the media.
-///
-/// If neither exists, a clear error referencing the [`transcribe_words`] hook
-/// is returned.
+/// 2. an adjacent `<media>.srt`/`.vtt` auto-detected next to the media, else
+/// 3. **transcription** — the audio is decoded in-process and run through
+///    whisper.cpp ([`transcribe_words`]), then grouped into sentence cues.
 pub fn cues_from_media(
     media_path: &str,
     explicit_subtitle: Option<&str>,
@@ -182,11 +194,18 @@ pub fn cues_from_media(
             let duration = media::probe_duration(&media_path).unwrap_or(0.0);
             Ok(segmenter::finalize(cues, duration, &media_path))
         }
-        None => Err(format!(
-            "no subtitle found for '{media_path}' (looked for <basename>.srt/.vtt). \
-             Pass one with `--subtitle`, or bind a whisper.cpp backend in \
-             `pipeline::transcribe::transcribe_words` to derive cues from the audio."
-        )),
+        None => {
+            // No subtitle anywhere: derive the sentence list from the audio.
+            let transcript = transcribe_words(media_path)?;
+            if transcript.words.is_empty() {
+                return Err(format!("speech-to-text found no words in '{media_path}'"));
+            }
+            Ok(build_cues(
+                &transcript.words,
+                transcript.duration_secs,
+                media_path,
+            ))
+        }
     }
 }
 
@@ -202,7 +221,7 @@ mod tests {
             Word { text: "Next".into(), start: 2.0, end: 2.5, score: 1.0 },
             Word { text: "sentence!".into(), start: 2.5, end: 3.0, score: 1.0 },
         ];
-        let cues = build_cues(&words, 10.0);
+        let cues = build_cues(&words, 10.0, "/media/sample.mp4");
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "Hello world.");
         assert_eq!(cues[1].text, "Next sentence!");
@@ -216,7 +235,7 @@ mod tests {
             Word { text: "one).".into(), start: 0.6, end: 1.0, score: 1.0 },
             Word { text: "Next.".into(), start: 1.5, end: 2.0, score: 1.0 },
         ];
-        let cues = build_cues(&words, 10.0);
+        let cues = build_cues(&words, 10.0, "/media/sample.mp4");
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "See (e.g. one).");
     }

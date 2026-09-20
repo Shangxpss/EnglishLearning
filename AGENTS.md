@@ -99,6 +99,39 @@ pnpm run dev            # both
 Processed sessions are persisted in SQLite at `~/.local/share/sentence-video/sessions.db`
 (override with `--data-dir <path>`); re-opening the same media reuses the cached session.
 
+## Speech-to-text is built into the binary
+
+A media file with **no subtitle** is segmented by transcribing its audio. The goal is that
+end users need no installs and no downloads: whisper.cpp is statically linked and the model
+is embedded in the executable (`include_bytes!`), so one file does everything.
+
+Build-machine prerequisites (NOT end-user requirements):
+
+1. **cmake** — `whisper-rs-sys` compiles the vendored whisper.cpp via cmake. A user-local
+   copy lives at `~/cmake/bin` and is added to `PATH` by `rust/scripts/cargo-shim.sh`
+   (extract the official `cmake-*-linux-x86_64.tar.gz` there; no sudo needed).
+2. **The model** (~60 MB, not committed — see `rust/.gitignore`):
+   ```bash
+   rust/scripts/fetch-asr-model.sh                 # ggml-base.en-q5_1.bin (default)
+   rust/scripts/fetch-asr-model.sh ggml-tiny.en-q5_1.bin   # smaller/faster
+   ```
+   `build.rs` embeds `rust/assets/models/ggml-base.en-q5_1.bin`; override with
+   `ASR_MODEL=<path>`. If absent, the build still succeeds and transcription then requires
+   `--asr-model <path>` at runtime.
+
+Resulting artifact: **~86 MB** (was ~25 MB without the model). `cargo build
+--no-default-features` skips speech-to-text entirely for a fast, small, model-free build.
+
+Runtime flags: `--asr-model <path>`, `--asr-language <code>` (default `en`). Sessions built
+this way record `source_format = "asr"` and are cached like any other (a re-selected video
+reuses the stored cues instead of re-transcribing).
+
+### Cargo registry note (temporary)
+
+`rsproxy.cn` (the configured crates.io mirror in `~/.cargo/config.toml`) is unreachable, so
+its `replace-with` line is currently commented out to use direct crates.io. A backup of the
+original file is at `~/.cargo/config.toml.bak-dsh`. Restore it once the mirror recovers.
+
 ## Known pre-existing type errors (do not chase these)
 
 `pnpm run build:web` first runs `tsc -b`, which currently reports 5 errors that predate

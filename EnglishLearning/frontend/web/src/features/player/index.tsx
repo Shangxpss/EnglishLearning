@@ -11,7 +11,7 @@ import { cn } from '@/lib/utils';
  *   GET  /api/session/{id}                         → { id, media_path, media_duration, cues[] }
  *   GET  /api/session/{id}/cues                    → sentence list
  *   GET  /api/session/{id}/media                   → Range-streamed source media
- *   GET  /api/session/{id}/segments/{idx}?start=&end=  → per-sentence WAV clip
+ *   GET  /api/session/{id}/audio?start=&end=       → exact WAV slice of a time range
  *
  * Every other page in this app targets the legacy Python/FastAPI backend, so
  * those routes are hidden from the top nav (but still reachable by URL).
@@ -328,27 +328,31 @@ export function PlayerPage() {
     }
   }, []);
 
-  /** FR-4.3: per-sentence WAV clip decoded in-process by the Rust server. */
+  /**
+   * Play one sentence as a server-decoded audio clip. Unlike normal playback
+   * (which seeks the original media in the browser), the Rust server extracts
+   * exactly `[cue.start, cue.end]`, so the boundaries are sample-accurate.
+   */
   const playClip = useCallback(
     (i: number) => {
       const s = session;
       const cs = cuesRef.current;
       if (!s || i < 0 || i >= cs.length) return;
       const cue = cs[i];
-      const url = `/api/session/${encodeURIComponent(s.id)}/segments/${cue.index}?start=${cue.start}&end=${cue.end}`;
+      const url = `/api/session/${encodeURIComponent(s.id)}/audio?start=${cue.start}&end=${cue.end}`;
       void new Audio(url).play().catch(() => {});
     },
     [session]
   );
 
-  // Auto-scroll the active sentence into view (FR-3.6).
+  // Auto-scroll the active sentence into view.
   useEffect(() => {
     if (activeIdx < 0 || !listRef.current) return;
     const el = listRef.current.querySelector<HTMLElement>(`[data-idx="${activeIdx}"]`);
     el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }, [activeIdx]);
 
-  // Keyboard shortcuts (FR-3.7).
+  // Keyboard shortcuts: ↑/↓ prev/next, Space play/pause, L loop, Enter replay.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (document.activeElement?.tagName || '').toUpperCase();
@@ -455,9 +459,11 @@ export function PlayerPage() {
         </div>
         <p className="text-xs text-muted-foreground">
           “Choose video…” opens a file dialog on the machine running the Rust server and
-          immediately processes the file it returns. If no subtitle is given the server looks
-          for a <code className="font-mono">.srt</code>/<code className="font-mono">.vtt</code>{' '}
-          next to the media. You can also type an absolute path manually.
+          immediately processes the file it returns. If a{' '}
+          <code className="font-mono">.srt</code>/<code className="font-mono">.vtt</code> sits
+          next to the media it is used; otherwise the audio is transcribed on the spot by the
+          built-in speech-to-text model (no internet needed). You can also type an absolute
+          path manually.
         </p>
 
         {loading ? (

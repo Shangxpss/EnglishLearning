@@ -9,6 +9,7 @@
 //! added later via `POST /api/session`).
 
 mod app;
+mod asr;
 mod db;
 mod media;
 mod models;
@@ -36,7 +37,10 @@ fn print_usage() {
          \x20   --no-browser           don't auto-open the browser\n\
          \x20   --host <addr>          bind address (default 127.0.0.1)\n\
          \x20   --port <n>             bind port; 0 = OS-assigned (default)\n\
-         \x20   --data-dir <path>      folder for the SQLite session database\n\n\
+         \x20   --data-dir <path>      folder for the SQLite session database\n\
+         \x20   --asr-model <path>     speech-to-text model file\n\
+         \x20                         (default: the model embedded in this binary)\n\
+         \x20   --asr-language <code>  spoken language for transcription (default: en)\n\n\
          REPLACE-AUDIO (batch, replaces a video's audio with a supplied track):\n\
          \x20   <video>    media whose audio will be replaced\n\
          \x20   <audio>    new audio track (mp3/wav/m4a/…)\n\
@@ -317,6 +321,8 @@ fn main() {
     let mut host = "127.0.0.1".to_string();
     let mut port = 0;
     let mut data_dir: Option<String> = None;
+    let mut asr_model: Option<std::path::PathBuf> = None;
+    let mut asr_language: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -331,6 +337,18 @@ fn main() {
                 i += 1;
                 if let Some(d) = args.get(i) {
                     data_dir = Some(d.clone());
+                }
+            }
+            "--asr-model" => {
+                i += 1;
+                if let Some(p) = args.get(i) {
+                    asr_model = Some(std::path::PathBuf::from(media::normalize_path(p)));
+                }
+            }
+            "--asr-language" => {
+                i += 1;
+                if let Some(l) = args.get(i) {
+                    asr_language = Some(l.clone());
                 }
             }
             "--host" => {
@@ -365,7 +383,8 @@ fn main() {
             db
         }
         Err(e) => {
-            // NFR-3: degrade gracefully — fall back to a temp database.
+            // Degrade gracefully rather than refusing to start: fall back to a
+            // temp database.
             let fallback_dir = std::env::temp_dir().join("sentence-video");
             eprintln!(
                 "sentence-video: {e}; falling back to {}",
@@ -381,6 +400,20 @@ fn main() {
         }
     };
     let state = Arc::new(app::AppState::new(cache_dir, db));
+
+    // Speech-to-text: the model is embedded in this executable, so a media file
+    // with no subtitle can still be segmented. `--asr-model` overrides it.
+    asr::init(asr_model, asr_language);
+    let asr_cfg = asr::config();
+    let asr_model = asr_cfg.model.as_deref();
+    if asr::model_available(asr_model) {
+        println!(
+            "sentence-video: speech-to-text model → {}",
+            asr::model_description(asr_model)
+        );
+    } else {
+        eprintln!("sentence-video: speech-to-text unavailable: {}", asr::NO_MODEL_HELP);
+    }
 
     // Auto-create (or resume) a session when a media file was passed in.
     if let Some(mp) = &media_path {

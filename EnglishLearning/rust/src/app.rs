@@ -158,24 +158,19 @@ impl AppState {
         }
         let media_duration = media::probe_duration(&media_path).map_err(|e| (500, e))?;
 
-        // v1 requires a subtitle file (a whisper.cpp transcription path is a
-        // future enhancement).
-        let subtitle_path = match subtitle_path {
-            Some(p) if Path::new(&p).is_file() => media::normalize_path(&p),
+        // Cue source: an explicit subtitle, else one sitting next to the media,
+        // else speech-to-text (the model is embedded in the executable).
+        let subtitle_path: Option<String> = match subtitle_path {
+            Some(p) if Path::new(&p).is_file() => Some(media::normalize_path(&p)),
             Some(p) => return Err((404, format!("subtitle file not found: {p}"))),
-            None => match auto_subtitle(&media_path) {
-                Some(p) => p,
-                None => {
-                    return Err((422, "no subtitle provided; supply subtitle_path or place a .srt/.vtt next to the media".to_string()))
-                }
-            },
+            None => auto_subtitle(&media_path),
         };
 
         let key = SourceKey {
             media_path: media_path.clone(),
             media_mtime: file_mtime(&media_path),
-            subtitle_path: Some(subtitle_path.clone()),
-            subtitle_mtime: file_mtime(&subtitle_path),
+            subtitle_path: subtitle_path.clone(),
+            subtitle_mtime: subtitle_path.as_deref().and_then(file_mtime),
         };
 
         // Cache hit: the same media + subtitle (unchanged) was processed before.
@@ -189,15 +184,37 @@ impl AppState {
             }
         }
 
-        let raw_cues = subtitle::parse_subtitle(&subtitle_path).map_err(|e| (422, e))?;
-        let cues = segmenter::finalize(raw_cues, media_duration, &media_path);
+        let (cues, source_format) = match &subtitle_path {
+            Some(path) => {
+                let raw_cues = subtitle::parse_subtitle(path).map_err(|e| (422, e))?;
+                (
+                    segmenter::finalize(raw_cues, media_duration, &media_path),
+                    subtitle::detect_format(path).to_string(),
+                )
+            }
+            None => {
+                let transcript = crate::pipeline::transcribe::transcribe_words(&media_path)
+                    .map_err(|e| (422, format!("no subtitle found and transcription failed: {e}")))?;
+                if transcript.words.is_empty() {
+                    return Err((422, format!("no speech found in '{media_path}'")));
+                }
+                (
+                    crate::pipeline::transcribe::build_cues(
+                        &transcript.words,
+                        media_duration,
+                        &media_path,
+                    ),
+                    "asr".to_string(),
+                )
+            }
+        };
 
         let id = gen_id();
         let session = Session {
             id: id.clone(),
             media_path,
             media_duration,
-            source_format: subtitle::detect_format(&subtitle_path).to_string(),
+            source_format,
             cues,
         };
         self.db
@@ -252,10 +269,8 @@ impl AppState {
                 bytes_ok(&body, "application/json; charset=utf-8")
             }
             Some("media") => self.stream_media(&session, req),
-            Some("segments") => {
-                let idx = segs.next().unwrap_or_default();
-                self.route_segment(&session, idx, req)
-            }
+            // Exact audio slice of an arbitrary time range, decoded server-side.
+            Some("audio") => self.route_audio(&session, req),
             Some("progress") => self.route_progress(&session, req),
             Some(_) => Response::not_found(),
         }
@@ -295,15 +310,34 @@ impl AppState {
         stream_file_range(path, media_type, req)
     }
 
-    fn route_segment(&self, session: &Session, _idx: &str, req: &Request) -> Response {
-        // Echo the requested slice back as a WAV decoded from the source.
-        let start = req.query.get("start").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-        let end = req.query.get("end").and_then(|v| v.parse::<f64>().ok()).unwrap_or(session.media_duration);
-        if end < start {
-            return Response::error(400, "end must be >= start");
+    /// `GET /api/session/{id}/audio?start=<sec>&end=<sec>`
+    ///
+    /// Decodes exactly that slice of the source into a 24 kHz mono WAV clip.
+    /// This is the server-side counterpart to `/media`: `/media` lets the
+    /// browser play and seek the original file itself, whereas this guarantees
+    /// sample-exact boundaries and returns audio only. `start`/`end` are
+    /// clamped to the media duration, and the temp WAV is deleted right after
+    /// it is read into the response.
+    fn route_audio(&self, session: &Session, req: &Request) -> Response {
+        let start = req
+            .query
+            .get("start")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .max(0.0);
+        let end = req
+            .query
+            .get("end")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(session.media_duration)
+            .min(session.media_duration);
+        if end <= start {
+            return Response::error(400, "end must be greater than start");
         }
         let sample_rate = 24000u32;
-        let out_path = self.cache_dir.join(format!("seg_{}_{}.wav", session.id, gen_id()));
+        let out_path = self
+            .cache_dir
+            .join(format!("clip_{}_{}.wav", session.id, gen_id()));
         match media::decode_segment_wav(&session.media_path, start, end, sample_rate, &out_path.to_string_lossy()) {
             Ok(()) => {
                 let data = match std::fs::read(&out_path) {
