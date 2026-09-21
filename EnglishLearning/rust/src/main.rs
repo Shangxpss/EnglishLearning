@@ -8,6 +8,11 @@
 //! With no arguments a server starts with an empty workspace (media can be
 //! added later via `POST /api/session`).
 
+// The agent service sits behind a feature so a media-only build stays small.
+// `run_agent_command` below needs this declaration: without it the whole
+// `src/agent/` tree is silently never compiled, and `agent::…` fails to resolve.
+#[cfg(feature = "agent")]
+mod agent;
 mod app;
 mod asr;
 mod db;

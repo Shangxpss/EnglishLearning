@@ -48,6 +48,10 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::mpsc as std_mpsc;
 
+// `ThreadSummary` is part of the engine's public surface (the shape
+// `ThreadStore::summaries` returns) but is referenced only by the runtime's
+// handlers, so it is re-exported rather than warned about here.
+#[allow(unused_imports)]
 pub use state::{ThreadStore, ThreadSummary};
 
 /// Step names reported through `STEP_STARTED` / `STEP_FINISHED`.

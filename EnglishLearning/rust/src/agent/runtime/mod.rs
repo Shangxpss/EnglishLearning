@@ -76,12 +76,14 @@ impl CopilotAgent {
     /// Build the agent (opens the model client and registers the tools).
     pub fn new(cfg: AgentConfig) -> Result<Self, String> {
         let llm = OpenAiClient::new(&cfg).map_err(|e| e.to_string())?;
+        // Read `cfg` before it is moved into the struct below.
+        let middleware = A2uiMiddleware::new(cfg.catalog_id.clone());
         Ok(CopilotAgent {
             cfg,
             registry: ToolRegistry::with_builtins(),
             llm,
             threads: ThreadStore::new(),
-            middleware: A2uiMiddleware::new(cfg.catalog_id.clone()),
+            middleware,
             started: Instant::now(),
         })
     }
@@ -398,13 +400,17 @@ mod tests {
 
     #[test]
     fn history_comes_from_the_run_context() {
+        // `tools` and `context` are required AG-UI fields (only `state` and
+        // `forwardedProps` default), so every real request carries them.
         let input: ag_ui::RunAgentInput = serde_json::from_value(json!({
             "threadId": "thread-1",
             "runId": "run-1",
             "messages": [
                 { "id": "m1", "role": "system", "content": "rules" },
                 { "id": "m2", "role": "user", "content": "hello" }
-            ]
+            ],
+            "tools": [],
+            "context": []
         }))
         .expect("RunAgentInput must deserialize the AG-UI request shape");
 

@@ -56,6 +56,10 @@ impl OpenAiClient {
     /// The returned stream yields [`Delta`]s and always ends with
     /// [`Delta::Done`] (also when the provider closed the connection without
     /// sending `[DONE]`), so callers can rely on a single terminator.
+    ///
+    /// The stream is `Box::pin`ned because `async_stream` produces a `!Unpin`
+    /// future: without the pin, `StreamExt::next` (which requires `Unpin`) does
+    /// not resolve at the call sites in [`crate::agent::engine`].
     pub async fn chat_stream(
         &self,
         messages: &[ChatMessage],
@@ -94,7 +98,7 @@ impl OpenAiClient {
 
         let mut bytes = response.bytes_stream();
 
-        Ok(async_stream::stream! {
+        Ok(Box::pin(async_stream::stream! {
             let mut buffer = String::new();
             while let Some(chunk) = bytes.next().await {
                 let chunk = match chunk {
@@ -132,7 +136,7 @@ impl OpenAiClient {
                 }
             }
             yield Ok(Delta::Done);
-        })
+        }))
     }
 }
 
