@@ -14,14 +14,19 @@
 //!
 //! # Layout
 //!
+//! The **protocol** half is delegated to the [`ag_ui`] crate (event vocabulary,
+//! SSE framing, `Agent`/`RunContext` hosting runtime, request type, axum mount).
+//! The modules below are the application half — what the SDK deliberately leaves
+//! out.
+//!
 //! | module | responsibility | replaces |
 //! | --- | --- | --- |
 //! | [`config`] | agent id, catalog id, model, credentials | env/`.env` in both stacks |
-//! | [`protocol`] | AG-UI events ([`protocol::ag_ui`]) and A2UI payloads ([`protocol::a2ui`]) | `ag_ui_langgraph`, `copilotkit.a2ui` |
-//! | [`llm`] | OpenAI-compatible chat client (DeepSeek) | `langchain_deepseek.ChatDeepSeek` |
+//! | [`protocol::a2ui`] | A2UI payloads carried by `ACTIVITY_SNAPSHOT` | `copilotkit.a2ui` |
+//! | [`llm`] | OpenAI-compatible streaming chat client (DeepSeek) | `langchain_deepseek.ChatDeepSeek` |
 //! | [`tools`] | tool trait + registry + built-in tools | `@tool` decorated functions |
 //! | [`engine`] | ReAct loop, thread state, system prompt | `LangGraph.create_agent` + `MemorySaver` |
-//! | [`runtime`] | HTTP routes, SSE, A2UI middleware | `index.ts` + `main.py` + `CopilotKitMiddleware` |
+//! | [`runtime`] | `impl ag_ui::server::Agent`, side endpoints, A2UI middleware | `index.ts` + `main.py` + `CopilotKitMiddleware` |
 //!
 //! # Running
 //!

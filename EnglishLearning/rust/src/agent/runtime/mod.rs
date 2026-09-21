@@ -3,177 +3,196 @@
 //! FastAPI app, in one process.
 //!
 //! ```text
-//! React (CopilotKit) ──HTTP/SSE──▶ this module ──▶ engine::run_turn ──▶ DeepSeek
+//! React (CopilotKit) ──HTTP/SSE──▶ ag_ui::axum ──▶ CopilotAgent::run ──▶ engine ──▶ DeepSeek
 //! ```
 //!
-//! Because the engine already speaks AG-UI, the runtime has no proxying to do:
-//! it validates the request, spawns the turn, and pipes the engine's event
-//! channel out as Server-Sent Events. The `HttpAgent` hop and the second HTTP
-//! server are gone.
+//! The protocol half is **not** hand-written any more: [`ag_ui`] owns the event
+//! vocabulary, SSE framing, request parsing, event-ordering verification and
+//! cancellation. This module contributes only the application half — the
+//! [`CopilotAgent`] implementation and a few side endpoints.
+//!
+//! | concern | owner |
+//! | --- | --- |
+//! | `POST` body → `RunAgentInput` | `ag_ui::axum` |
+//! | `RUN_STARTED` / `RUN_FINISHED` / `RUN_ERROR` framing | `ag_ui::server` run driver |
+//! | SSE encoding, `Accept` negotiation, CORS-compatible body | `ag_ui::encode` + `ag_ui::axum` |
+//! | cancellation on client disconnect | `ag_ui::server::CancellationToken` |
+//! | the agent loop, tools, model calls, A2UI payloads | this crate |
 //!
 //! # Endpoints
 //!
 //! | method | path | purpose |
 //! | --- | --- | --- |
+//! | `POST` | `/copilotkit` | run a turn (AG-UI SSE) |
+//! | `POST` | `/copilotkit/agent/{agent_id}/run` | same, addressed by agent id |
 //! | `GET` | `/health` | liveness |
 //! | `GET` | `/copilotkit/info` | agent + catalog information |
-//! | `POST` | `/copilotkit/agent/{agent_id}/run` | run a turn (SSE) |
-//! | `GET` | `/copilotkit/agent/{agent_id}/connect` | persistent SSE channel |
-//! | `POST` | `/copilotkit/agent/{agent_id}/stop/{thread_id}` | stop a running turn |
 //! | `GET`/`POST` | `/copilotkit/threads` | list / create threads |
 //! | `DELETE` | `/copilotkit/threads/{thread_id}` | forget a thread |
-//! | `POST` | `/copilotkit` | single-endpoint alias for `/run` |
+//! | `POST` | `/copilotkit/agent/{agent_id}/stop/{thread_id}` | see [`stop_run`] |
 
 pub mod middleware;
 
 use crate::agent::config::AgentConfig;
-use crate::agent::engine::{self, ThreadStore};
-use crate::agent::llm::{ChatMessage, OpenAiClient};
+use crate::agent::engine::{self, EventSink, RequestEnricher, SinkClosed, ThreadStore};
+use crate::agent::llm::{ChatMessage, LlmError, OpenAiClient};
 use crate::agent::new_id;
-use crate::agent::protocol::AgUiEvent;
 use crate::agent::tools::ToolRegistry;
 use middleware::A2uiMiddleware;
+
+use ag_ui::axum::RouterExt;
+use ag_ui::server::{Agent, Result as AgUiResult, RunContext};
+use ag_ui::{Event, RunOutcome};
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
+    response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
 
-/// Channel depth between the engine and the SSE writer.
+// ─────────────────────────────────────────────────────────────────────────
+// The agent
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The application half of the AG-UI endpoint.
 ///
-/// Small enough to bound memory, large enough that a burst of tool events never
-/// blocks the engine.
-const EVENT_BUFFER: usize = 64;
-
-// ─────────────────────────────────────────────────────────────────────────
-// Service state
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Everything the handlers share.
-pub struct AgentService {
+/// `State = ()` because the conversation arrives with every run (AG-UI is
+/// stateless per request) — there is no per-run state to publish.
+pub struct CopilotAgent {
     cfg: AgentConfig,
     registry: ToolRegistry,
     llm: OpenAiClient,
     threads: ThreadStore,
     middleware: A2uiMiddleware,
-    /// Threads asked to stop. Checked by the SSE writer, which then drops the
-    /// event channel — the engine notices on its next emit and unwinds.
-    stopped: Mutex<HashSet<String>>,
     started: Instant,
 }
 
-impl AgentService {
-    /// Build the service (opens the model client and registers the tools).
+impl CopilotAgent {
+    /// Build the agent (opens the model client and registers the tools).
     pub fn new(cfg: AgentConfig) -> Result<Self, String> {
         let llm = OpenAiClient::new(&cfg).map_err(|e| e.to_string())?;
-        let registry = ToolRegistry::with_builtins();
-        let middleware = A2uiMiddleware::new(cfg.catalog_id.clone());
-        Ok(AgentService {
+        Ok(CopilotAgent {
             cfg,
-            registry,
+            registry: ToolRegistry::with_builtins(),
             llm,
             threads: ThreadStore::new(),
-            middleware,
-            stopped: Mutex::new(HashSet::new()),
+            middleware: A2uiMiddleware::new(cfg.catalog_id.clone()),
             started: Instant::now(),
         })
     }
 
-    fn mark_stopped(&self, thread_id: &str) {
-        self.stopped
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(thread_id.to_string());
-    }
-
-    fn clear_stopped(&self, thread_id: &str) {
-        self.stopped
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(thread_id);
-    }
-
-    fn is_stopped(&self, thread_id: &str) -> bool {
-        self.stopped
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(thread_id)
+    /// The enricher handed to the engine (A2UI catalog guidance + surfaces).
+    fn enricher(&self) -> &dyn RequestEnricher {
+        &self.middleware
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Request payload (AG-UI `RunAgentInput`)
-// ─────────────────────────────────────────────────────────────────────────
+impl Agent for CopilotAgent {
+    type State = ();
 
-/// The body CopilotKit posts to `/run`.
+    /// Serve one run.
+    ///
+    /// Everything protocol-shaped — `RUN_STARTED`, ordering checks,
+    /// `RUN_FINISHED`/`RUN_ERROR`, SSE framing — belongs to the ag-ui driver,
+    /// which calls this method in the middle of a run it has already opened.
+    async fn run(&self, ctx: &mut RunContext<()>) -> AgUiResult<RunOutcome> {
+        let thread_id = ctx.thread_id().as_str().to_string();
+        let messages = history_from(ctx);
+
+        if messages.is_empty() {
+            return Err(error_message("the request contained no user message"));
+        }
+
+        let mut sink = RunContextSink { ctx };
+        match engine::run_turn(
+            &self.cfg,
+            &self.llm,
+            &self.registry,
+            &self.threads,
+            self.enricher(),
+            &thread_id,
+            messages,
+            &mut sink,
+        )
+        .await
+        {
+            Ok(()) => Ok(RunOutcome::Success),
+            Err(e) => Err(engine_error(e)),
+        }
+    }
+}
+
+/// Adapts `ag_ui::server::RunContext` to the engine's [`EventSink`].
 ///
-/// Only the fields this service uses are modelled; unknown fields are ignored so
-/// a newer frontend cannot break the agent.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunAgentInput {
-    #[serde(default)]
-    pub thread_id: Option<String>,
-    #[serde(default)]
-    pub run_id: Option<String>,
-    #[serde(default)]
-    pub messages: Vec<ClientMessage>,
-    #[serde(default)]
-    pub state: Option<Value>,
-    #[serde(default)]
-    pub context: Option<Value>,
-    #[serde(default)]
-    pub forwarded_props: Option<Value>,
+/// `RunContext::emit` already fails once the run is cancelled or the client has
+/// disconnected, so cancellation needs no extra plumbing: the engine unwinds on
+/// the first failed emit.
+struct RunContextSink<'a> {
+    ctx: &'a mut RunContext<()>,
 }
 
-/// One message from the browser.
-#[derive(Debug, Deserialize)]
-pub struct ClientMessage {
-    pub role: String,
-    /// Either a string or an array of content parts (`[{"type":"text","text":…}]`).
-    #[serde(default)]
-    pub content: Option<Value>,
-    #[serde(default)]
-    pub id: Option<String>,
-}
-
-impl RunAgentInput {
-    /// Convert the client messages into model messages, dropping anything empty
-    /// or of an unknown role (the frontend echoes tool traffic back, which the
-    /// model must not see twice).
-    pub fn into_chat_messages(self) -> Vec<ChatMessage> {
-        self.messages
-            .iter()
-            .filter_map(ClientMessage::to_chat_message)
-            .collect()
+impl EventSink for RunContextSink<'_> {
+    fn emit(&mut self, event: Event) -> Result<(), SinkClosed> {
+        self.ctx.emit(event).map_err(|_| SinkClosed)
     }
 }
 
-impl ClientMessage {
-    fn to_chat_message(&self) -> Option<ChatMessage> {
-        let text = content_to_text(self.content.as_ref()?);
-        if text.trim().is_empty() {
-            return None;
-        }
-        match self.role.to_ascii_lowercase().as_str() {
-            "system" => Some(ChatMessage::system(text)),
-            "user" => Some(ChatMessage::user(text)),
-            "assistant" => Some(ChatMessage::assistant(text)),
-            _ => None,
-        }
+/// Turn a model failure into a `RUN_ERROR` payload.
+fn engine_error(error: LlmError) -> ag_ui::server::Error {
+    error_message(error.to_string())
+}
+
+/// Build a `server::Error` carrying a message.
+///
+/// `ag_ui::server::Error` exposes no message constructor, but the crate does
+/// convert `serde_json::Error` (it uses `?` on `serde_json::from_value` while
+/// decoding state), so the text rides in as a JSON error.
+fn error_message(message: impl Into<String>) -> ag_ui::server::Error {
+    serde_json::Error::io(std::io::Error::other(message.into())).into()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reading the conversation out of the run context
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Read the client's conversation from the run context.
+///
+/// AG-UI sends the whole history with every run, so the context — not a local
+/// store — is the source of truth. `Message` is a protocol union whose content
+/// may be a string or an array of parts, so it is flattened through its JSON
+/// form rather than matched field by field; that keeps working when the
+/// protocol adds a message kind.
+fn history_from(ctx: &RunContext<()>) -> Vec<ChatMessage> {
+    let Ok(value) = serde_json::to_value(ctx.messages()) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items.iter().filter_map(message_to_chat).collect()
+}
+
+/// Convert one serialized AG-UI message into a model message.
+///
+/// Messages with no text (tool traffic the frontend echoes back, empty
+/// assistant turns) are dropped — the model must not see them twice.
+fn message_to_chat(message: &Value) -> Option<ChatMessage> {
+    let role = message.get("role")?.as_str()?;
+    let text = content_to_text(message.get("content")?);
+    if text.trim().is_empty() {
+        return None;
+    }
+    match role.to_ascii_lowercase().as_str() {
+        // AG-UI has both `system` and `developer` roles; both are instructions.
+        "system" | "developer" => Some(ChatMessage::system(text)),
+        "user" => Some(ChatMessage::user(text)),
+        "assistant" => Some(ChatMessage::assistant(text)),
+        _ => None,
     }
 }
 
@@ -197,40 +216,41 @@ fn content_to_text(content: &Value) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Handlers
+// Side endpoints
 // ─────────────────────────────────────────────────────────────────────────
 
-async fn health(State(service): State<Arc<AgentService>>) -> impl IntoResponse {
+async fn health(State(agent): State<Arc<CopilotAgent>>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
         "service": "sentence-video agent",
-        "uptimeSeconds": service.started.elapsed().as_secs(),
-        "threads": service.threads.len(),
-        "credentials": service.cfg.has_credentials(),
+        "uptimeSeconds": agent.started.elapsed().as_secs(),
+        "threads": agent.threads.len(),
+        "credentials": agent.cfg.has_credentials(),
+        "protocol": "ag-ui (ag-ui crate)",
     }))
 }
 
-async fn info(State(service): State<Arc<AgentService>>) -> impl IntoResponse {
-    let cfg = &service.cfg;
+async fn info(State(agent): State<Arc<CopilotAgent>>) -> impl IntoResponse {
+    let cfg = &agent.cfg;
     Json(json!({
         "agents": {
             cfg.agent_id.clone(): {
                 "name": cfg.agent_name,
                 "description": cfg.agent_description,
-                "model": service.llm.model(),
+                "model": agent.llm.model(),
             }
         },
         "a2ui": {
-            "defaultCatalogId": service.middleware.catalog_id(),
+            "defaultCatalogId": agent.middleware.catalog_id(),
             "injectA2UITool": true,
         },
-        "tools": service.registry.names(),
-        "endpoint": service.llm.endpoint(),
+        "tools": agent.registry.names(),
+        "endpoint": agent.llm.endpoint(),
     }))
 }
 
-async fn list_threads(State(service): State<Arc<AgentService>>) -> impl IntoResponse {
-    Json(json!({ "threads": service.threads.summaries() }))
+async fn list_threads(State(agent): State<Arc<CopilotAgent>>) -> impl IntoResponse {
+    Json(json!({ "threads": agent.threads.summaries() }))
 }
 
 async fn create_thread() -> impl IntoResponse {
@@ -239,143 +259,37 @@ async fn create_thread() -> impl IntoResponse {
 }
 
 async fn delete_thread(
-    State(service): State<Arc<AgentService>>,
+    State(agent): State<Arc<CopilotAgent>>,
     Path(thread_id): Path<String>,
 ) -> impl IntoResponse {
-    let existed = service.threads.clear(&thread_id);
+    let existed = agent.threads.clear(&thread_id);
     Json(json!({ "deleted": existed, "id": thread_id }))
 }
 
-/// `POST /copilotkit/agent/{agent_id}/run`
-async fn run_agent(
-    State(service): State<Arc<AgentService>>,
-    Path(agent_id): Path<String>,
-    Json(input): Json<RunAgentInput>,
-) -> Response {
-    if agent_id != service.cfg.agent_id {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": format!("unknown agent '{agent_id}'"),
-                "agents": [service.cfg.agent_id.clone()],
-            })),
-        )
-            .into_response();
-    }
-    stream_run(service, input)
-}
-
-/// `POST /copilotkit` — the single-endpoint mode.
-async fn run_default_agent(
-    State(service): State<Arc<AgentService>>,
-    Json(input): Json<RunAgentInput>,
-) -> Response {
-    stream_run(service, input)
-}
-
-/// `GET /copilotkit/agent/{agent_id}/connect`
-///
-/// A persistent SSE channel. This service is stateless per run, so the channel
-/// carries no traffic of its own — it exists so the client's connection
-/// handshake succeeds, and it is kept alive until the client goes away.
-async fn connect(State(service): State<Arc<AgentService>>, Path(agent_id): Path<String>) -> Response {
-    if agent_id != service.cfg.agent_id {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let idle = futures_util::stream::pending::<Result<Event, Infallible>>();
-    Sse::new(idle).keep_alive(KeepAlive::default()).into_response()
-}
-
 /// `POST /copilotkit/agent/{agent_id}/stop/{thread_id}`
+///
+/// Kept for API compatibility only. There is nothing to signal here: a run is
+/// cancelled by the client closing the SSE response, which the ag-ui transport
+/// turns into a cancel token that fails every subsequent emit. Reporting that
+/// honestly is better than pretending this endpoint stops anything.
 async fn stop_run(
-    State(service): State<Arc<AgentService>>,
+    State(agent): State<Arc<CopilotAgent>>,
     Path((agent_id, thread_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    if agent_id != service.cfg.agent_id {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "unknown agent" })));
+    if agent_id != agent.cfg.agent_id {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown agent '{agent_id}'") })),
+        );
     }
-    service.mark_stopped(&thread_id);
-    (StatusCode::OK, Json(json!({ "stopped": true, "threadId": thread_id })))
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// SSE plumbing
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Spawn the turn and stream its events back as SSE.
-fn stream_run(service: Arc<AgentService>, input: RunAgentInput) -> Response {
-    let thread_id = input
-        .thread_id
-        .clone()
-        .unwrap_or_else(|| new_id("thread"));
-
-    // A thread that was stopped earlier must be runnable again.
-    service.clear_stopped(&thread_id);
-
-    let messages = input.into_chat_messages();
-    let (tx, rx) = mpsc::channel::<AgUiEvent>(EVENT_BUFFER);
-
-    {
-        let service = Arc::clone(&service);
-        let thread_id = thread_id.clone();
-        tokio::spawn(async move {
-            if messages.is_empty() {
-                // Nothing to answer — report it as a normal run error so the UI
-                // shows a message instead of an empty response.
-                let _ = tx
-                    .send(AgUiEvent::error("the request contained no user message"))
-                    .await;
-                let _ = tx
-                    .send(AgUiEvent::RunFinished {
-                        thread_id: thread_id.clone(),
-                        run_id: new_id("run"),
-                    })
-                    .await;
-                return;
-            }
-
-            if let Err(e) = engine::run_turn(
-                &service.cfg,
-                &service.llm,
-                &service.registry,
-                &service.threads,
-                &service.middleware,
-                &thread_id,
-                messages,
-                tx.clone(),
-            )
-            .await
-            {
-                // The engine already emitted a RUN_ERROR for the model path;
-                // this covers anything that escaped it.
-                let _ = tx.send(AgUiEvent::error(e.to_string())).await;
-            }
-        });
-    }
-
-    // Bridge the event channel to SSE. Ending this stream drops `rx`, which makes
-    // the engine's next emit fail and unwinds the turn — that is how /stop and a
-    // closed tab both cancel a run.
-    let stream = async_stream::stream! {
-        let mut rx = rx;
-        while let Some(event) = rx.recv().await {
-            if service.is_stopped(&thread_id) {
-                break;
-            }
-            let terminal =
-                event.name() == crate::agent::protocol::ag_ui::kind::RUN_FINISHED;
-            yield Ok::<Event, Infallible>(
-                Event::default().event(event.name()).data(event.to_sse_data()),
-            );
-            if terminal {
-                break;
-            }
-        }
-    };
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    (
+        StatusCode::OK,
+        Json(json!({
+            "stopped": false,
+            "threadId": thread_id,
+            "reason": "cancellation is driven by closing the SSE response, not by this endpoint",
+        })),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -383,30 +297,31 @@ fn stream_run(service: Arc<AgentService>, input: RunAgentInput) -> Response {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Build the router. Exposed for tests and for embedding in another server.
-pub fn router(service: Arc<AgentService>) -> Router {
+pub fn router(agent: Arc<CopilotAgent>) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/copilotkit", post(run_default_agent))
         .route("/copilotkit/info", get(info))
         .route("/copilotkit/threads", get(list_threads).post(create_thread))
         .route("/copilotkit/threads/{thread_id}", delete(delete_thread))
-        .route("/copilotkit/agent/{agent_id}/run", post(run_agent))
-        .route("/copilotkit/agent/{agent_id}/connect", get(connect))
         .route(
             "/copilotkit/agent/{agent_id}/stop/{thread_id}",
             post(stop_run),
         )
+        .with_state(Arc::clone(&agent))
+        // `route_agui` supplies request parsing, ordering verification, SSE
+        // framing, content negotiation and disconnect cancellation.
+        .route_agui("/copilotkit", Arc::clone(&agent))
+        .route_agui("/copilotkit/agent/{agent_id}/run", agent)
         // Permissive CORS mirrors the old Bun runtime and the FastAPI app; the
         // service binds to loopback by default, so this is a local-only surface.
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(service)
 }
 
 /// Start the service and block until the process ends.
 pub fn serve(cfg: AgentConfig) -> Result<(), String> {
     let bind = cfg.bind_addr();
-    let service = Arc::new(AgentService::new(cfg)?);
-    let app = router(Arc::clone(&service));
+    let agent = Arc::new(CopilotAgent::new(cfg)?);
+    let app = router(Arc::clone(&agent));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -422,15 +337,15 @@ pub fn serve(cfg: AgentConfig) -> Result<(), String> {
         println!("sentence-video agent: listening on http://{local}/copilotkit");
         println!(
             "sentence-video agent: agent '{}', model '{}', catalog '{}'",
-            service.cfg.agent_id,
-            service.llm.model(),
-            service.middleware.catalog_id()
+            agent.cfg.agent_id,
+            agent.llm.model(),
+            agent.middleware.catalog_id()
         );
         println!(
             "sentence-video agent: tools: {}",
-            service.registry.names().join(", ")
+            agent.registry.names().join(", ")
         );
-        if !service.cfg.has_credentials() {
+        if !agent.cfg.has_credentials() {
             eprintln!(
                 "sentence-video agent: DEEPSEEK_API_KEY is not set — /run will answer with RUN_ERROR."
             );
@@ -445,6 +360,7 @@ pub fn serve(cfg: AgentConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::llm::Role;
 
     #[test]
     fn flattens_string_and_part_array_content() {
@@ -458,54 +374,63 @@ mod tests {
 
     #[test]
     fn keeps_only_speakable_roles_with_text() {
-        let input = RunAgentInput {
-            thread_id: Some("t1".into()),
-            messages: vec![
-                ClientMessage { role: "system".into(), content: Some(json!("rules")), id: None },
-                ClientMessage { role: "user".into(), content: Some(json!("hi")), id: None },
-                ClientMessage { role: "tool".into(), content: Some(json!("ignored")), id: None },
-                ClientMessage { role: "assistant".into(), content: Some(json!("")), id: None },
-                ClientMessage {
-                    role: "user".into(),
-                    content: Some(json!([{ "type": "text", "text": "second" }])),
-                    id: None,
-                },
-            ],
-            ..Default::default()
-        };
+        let chat = |v: Value| message_to_chat(&v);
 
-        let messages = input.into_chat_messages();
-        let roles: Vec<_> = messages.iter().map(|m| m.role).collect();
         assert_eq!(
-            roles,
-            vec![
-                crate::agent::llm::Role::System,
-                crate::agent::llm::Role::User,
-                crate::agent::llm::Role::User
-            ]
+            chat(json!({ "role": "user", "content": "hi" })).unwrap().role,
+            Role::User
         );
-        assert_eq!(messages[2].content.as_deref(), Some("second"));
+        assert_eq!(
+            chat(json!({ "role": "developer", "content": "rules" })).unwrap().role,
+            Role::System
+        );
+        assert!(chat(json!({ "role": "tool", "content": "ignored" })).is_none());
+        assert!(chat(json!({ "role": "assistant", "content": "" })).is_none());
+        assert!(chat(json!({ "role": "user" })).is_none());
+        assert_eq!(
+            chat(json!({ "role": "user", "content": [{ "type": "text", "text": "second" }] }))
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("second")
+        );
     }
 
     #[test]
-    fn service_reports_the_configured_agent_and_tools() {
-        let service = AgentService::new(AgentConfig::default()).unwrap();
-        assert_eq!(service.cfg.agent_id, "sample_agent");
-        assert_eq!(service.middleware.catalog_id(), "generative-agent-catalog");
-        assert!(service.registry.names().contains(&"display_register_form"));
-        assert!(!service.cfg.has_credentials());
+    fn history_comes_from_the_run_context() {
+        let input: ag_ui::RunAgentInput = serde_json::from_value(json!({
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "messages": [
+                { "id": "m1", "role": "system", "content": "rules" },
+                { "id": "m2", "role": "user", "content": "hello" }
+            ]
+        }))
+        .expect("RunAgentInput must deserialize the AG-UI request shape");
+
+        let (ctx, _receiver) = RunContext::<()>::new(input).expect("context");
+        let messages = history_from(&ctx);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].content.as_deref(), Some("hello"));
+        assert_eq!(ctx.thread_id().as_str(), "thread-1");
     }
 
     #[test]
-    fn stop_flags_are_per_thread_and_clearable() {
-        let service = AgentService::new(AgentConfig::default()).unwrap();
-        assert!(!service.is_stopped("t1"));
+    fn agent_reports_the_configured_identity_and_tools() {
+        let agent = CopilotAgent::new(AgentConfig::default()).unwrap();
+        assert_eq!(agent.cfg.agent_id, "sample_agent");
+        assert_eq!(agent.middleware.catalog_id(), "generative-agent-catalog");
+        assert!(agent.registry.names().contains(&"display_register_form"));
+        assert!(!agent.cfg.has_credentials());
+    }
 
-        service.mark_stopped("t1");
-        assert!(service.is_stopped("t1"));
-        assert!(!service.is_stopped("t2"));
-
-        service.clear_stopped("t1");
-        assert!(!service.is_stopped("t1"));
+    #[test]
+    fn errors_are_reported_as_run_errors_not_panics() {
+        // Constructing a server error must not require a variant this crate
+        // cannot see; the message has to survive the trip.
+        let error = error_message("boom");
+        assert!(error.to_string().contains("boom"));
     }
 }

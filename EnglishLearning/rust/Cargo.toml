@@ -24,6 +24,7 @@ path = "src/main.rs"
 default = ["asr-whisper", "agent"]
 asr-whisper = ["dep:whisper-rs"]
 agent = [
+    "dep:ag-ui",
     "dep:axum",
     "dep:tokio",
     "dep:tower-http",
@@ -46,9 +47,14 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 whisper-rs = { version = "0.16.0", optional = true }
 
 # ── agent service (feature "agent") ──────────────────────────────────────────
-# Replaces `@copilotkit/runtime` (Bun) and FastAPI + LangGraph (Python):
-# axum serves the AG-UI SSE endpoints, reqwest talks to the OpenAI-compatible
-# model API. `rustls-tls` keeps the "no system OpenSSL" property of this crate.
+# Replaces `@copilotkit/runtime` (Bun) and FastAPI + LangGraph (Python).
+#
+# `ag-ui` is the AG-UI protocol SDK: it owns the event vocabulary (all 36 event
+# types), the SSE framing, the `Agent` trait / `RunContext` hosting runtime, the
+# request type and the axum mount. This crate supplies only what the SDK
+# deliberately leaves out: the model client, the tool runtime and the A2UI
+# payloads. Its `axum` feature is the only one that pulls in tokio.
+ag-ui = { version = "0.4", optional = true, features = ["axum"] }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", optional = true, features = [
     "rt-multi-thread",

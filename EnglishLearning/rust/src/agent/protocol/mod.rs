@@ -1,13 +1,18 @@
 //! Wire protocols shared with the CopilotKit frontend.
 //!
-//! * [`ag_ui`] — the event stream the browser consumes (replaces `ag_ui_langgraph`).
-//! * [`a2ui`] — the declarative UI payloads embedded in those events (replaces
-//!   `copilotkit.a2ui`).
-//!
-//! Both are plain JSON, so the Rust side builds them with `serde` instead of
-//! pulling in a framework.
+//! * **AG-UI** — the event stream the browser consumes. This is now provided by
+//!   the [`ag_ui`] crate (`ag_ui::Event`, `ag_ui::server`, `ag_ui::axum`), which
+//!   implements the full event vocabulary and SSE framing. Nothing in this
+//!   module re-implements it; the crate is used directly from
+//!   [`crate::agent::engine`] and [`crate::agent::runtime`].
+//! * [`a2ui`] — the declarative UI payloads carried inside AG-UI
+//!   `ACTIVITY_SNAPSHOT` events. AG-UI has no opinion about these, so they are
+//!   built here with `serde_json` (replacing `copilotkit.a2ui`).
 
 pub mod a2ui;
-pub mod ag_ui;
 
-pub use ag_ui::AgUiEvent;
+/// Activity type used for A2UI surfaces inside `ACTIVITY_SNAPSHOT` events.
+///
+/// AG-UI leaves `activityType` to the application; the frontend A2UI renderer
+/// keys off this value.
+pub const A2UI_ACTIVITY_TYPE: &str = "a2ui-surface";

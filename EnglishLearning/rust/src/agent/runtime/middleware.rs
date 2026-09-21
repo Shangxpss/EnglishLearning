@@ -14,11 +14,14 @@
 //!
 //! What is left is small, and it is the only place that knows about the A2UI
 //! catalog — which is why the engine only sees the [`RequestEnricher`] trait.
+//! The `ACTIVITY_SNAPSHOT` it builds is a real [`ag_ui::Event`], so it passes
+//! through the crate's ordering verifier like any other event.
 
 use crate::agent::engine::RequestEnricher;
 use crate::agent::llm::{ChatMessage, Role};
 use crate::agent::new_id;
-use crate::agent::protocol::AgUiEvent;
+use crate::agent::protocol::{a2ui, A2UI_ACTIVITY_TYPE};
+use ag_ui::Event;
 use serde_json::Value;
 
 /// Adds A2UI catalog guidance to requests and turns tool output into UI events.
@@ -76,11 +79,14 @@ impl RequestEnricher for A2uiMiddleware {
         messages.insert(index, ChatMessage::system(self.guidelines()));
     }
 
-    fn snapshot(&self, tool_name: &str, operations: Value) -> AgUiEvent {
-        eprintln!("agent: emitting A2UI surface from tool '{tool_name}'");
-        // The payload is the operation array itself (what Python's `render()`
-        // produced) so the frontend renderer needs no extra unwrapping.
-        AgUiEvent::a2ui_snapshot(new_id("a2ui"), operations)
+    fn snapshot(&self, tool_name: &str, operations: Value) -> Event {
+        // AG-UI wants an object payload, A2UI produces an array — the wrapper in
+        // `a2ui::activity_content` reconciles the two and records the tool.
+        Event::activity_snapshot(
+            new_id("a2ui"),
+            A2UI_ACTIVITY_TYPE,
+            a2ui::activity_content(tool_name, operations),
+        )
     }
 }
 
@@ -88,6 +94,13 @@ impl RequestEnricher for A2uiMiddleware {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn event_type(event: &Event) -> String {
+        serde_json::to_value(event).unwrap()["type"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
 
     #[test]
     fn guidelines_name_the_catalog_and_the_real_components() {
@@ -127,14 +140,15 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_wraps_the_operation_array_as_the_payload() {
+    fn snapshot_wraps_the_operations_in_an_activity_object() {
         let mw = A2uiMiddleware::new("cat");
         let ops = json!([{ "createSurface": { "surfaceId": "s" } }]);
         let event = mw.snapshot("display_register_form", ops.clone());
 
-        assert_eq!(event.name(), "ACTIVITY_SNAPSHOT");
+        assert_eq!(event_type(&event), "ACTIVITY_SNAPSHOT");
         let value = serde_json::to_value(&event).unwrap();
-        assert_eq!(value["activityType"], "a2ui-surface");
-        assert_eq!(value["content"], ops);
+        assert_eq!(value["activityType"], A2UI_ACTIVITY_TYPE);
+        assert_eq!(value["content"]["tool"], "display_register_form");
+        assert_eq!(value["content"]["operations"], ops);
     }
 }

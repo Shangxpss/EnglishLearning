@@ -7,9 +7,10 @@
 //! component the frontend catalog defines.
 //!
 //! Operations are single-key objects (`{"createSurface": {…}}`) and are shipped
-//! to the browser inside an AG-UI `ACTIVITY_SNAPSHOT` event
-//! ([`super::ag_ui::AgUiEvent::a2ui_snapshot`]).
+//! to the browser inside an AG-UI `ACTIVITY_SNAPSHOT` event — see
+//! [`activity_content`], which builds the object that event carries.
 
+use ag_ui::JsonObject;
 use serde_json::{json, Value};
 
 /// Operation name constants (A2UI v0.9).
@@ -100,6 +101,20 @@ pub fn delete_surface(surface_id: &str) -> Value {
 /// a JSON array ready to be embedded in an `ACTIVITY_SNAPSHOT`.
 pub fn render(operations: Vec<Value>) -> Value {
     Value::Array(operations)
+}
+
+/// Build the `content` object of an AG-UI `ACTIVITY_SNAPSHOT` carrying A2UI.
+///
+/// AG-UI requires the activity payload to be a JSON **object**
+/// (`ag_ui::Event::activity_snapshot` takes a [`JsonObject`]), whereas A2UI
+/// operations are an **array**. They therefore ride under `operations`, with the
+/// tool that produced them recorded next to them — which is what makes a
+/// mis-rendered surface traceable in the browser.
+pub fn activity_content(tool_name: &str, operations: Value) -> JsonObject {
+    let mut content = JsonObject::new();
+    content.insert("tool".to_string(), Value::String(tool_name.to_string()));
+    content.insert("operations".to_string(), operations);
+    content
 }
 
 // ─────────────────────────────────────────────────────────────────────────
