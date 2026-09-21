@@ -15,8 +15,22 @@ path = "src/main.rs"
 # installs and no downloads: whisper.cpp is compiled and statically linked by
 # `whisper-rs-sys` (which vendors the C++ source), and the model is embedded.
 # Use `--no-default-features` for a fast, model-free build.
-default = ["asr-whisper"]
+#
+# `agent` is the CopilotKit/AG-UI service — the Rust port of `AI-Demo/agent-runtime`
+# (Bun) and `AI-Demo/backend` (Python). It is on by default so one binary serves
+# both the media player and the agent, matching the single-executable goal.
+# Drop it with `--no-default-features --features asr-whisper` when only the
+# media player is needed (this also removes tokio/axum/reqwest).
+default = ["asr-whisper", "agent"]
 asr-whisper = ["dep:whisper-rs"]
+agent = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:tower-http",
+    "dep:reqwest",
+    "dep:futures-util",
+    "dep:async-stream",
+]
 
 [dependencies]
 # `build` statically compiles & embeds FFmpeg from source, so the produced
@@ -30,6 +44,27 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Optional: builds whisper.cpp from the vendored source (needs `cmake` on the
 # BUILD machine only) and links it statically.
 whisper-rs = { version = "0.16.0", optional = true }
+
+# ── agent service (feature "agent") ──────────────────────────────────────────
+# Replaces `@copilotkit/runtime` (Bun) and FastAPI + LangGraph (Python):
+# axum serves the AG-UI SSE endpoints, reqwest talks to the OpenAI-compatible
+# model API. `rustls-tls` keeps the "no system OpenSSL" property of this crate.
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", optional = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+] }
+tower-http = { version = "0.6", optional = true, features = ["cors"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+futures-util = { version = "0.3", optional = true }
+async-stream = { version = "0.3", optional = true }
 
 [profile.release]
 opt-level = 3

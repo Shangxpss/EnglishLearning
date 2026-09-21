@@ -31,7 +31,16 @@ fn print_usage() {
          USAGE:\n\
          \x20 sentence-video [serve] <media-file> [OPTIONS]\n\
          \x20 sentence-video replace-audio <video> <audio> <output> [--bitrate <bps>] [--full]\n\
-         \x20 sentence-video dub <video> <output> [--subtitle <srt>|<vtt>] [OPTIONS]\n\n\
+         \x20 sentence-video dub <video> <output> [--subtitle <srt>|<vtt>] [OPTIONS]\n\
+         \x20 sentence-video agent [--host <addr>] [--port <n>] [OPTIONS]\n\n\
+         AGENT MODE (CopilotKit / AG-UI service; replaces the AI-Demo Bun runtime + Python backend):\n\
+         \x20   --host <addr>          bind address (default 127.0.0.1)\n\
+         \x20   --port <n>             bind port (default 4000)\n\
+         \x20   --model <name>         model id (default deepseek-chat)\n\
+         \x20   --agent-id <id>        agent id (default sample_agent)\n\
+         \x20   --catalog-id <id>      A2UI catalog id (default generative-agent-catalog)\n\
+         \x20   --max-steps <n>        max model turns per run (default 8)\n\
+         \x20   --api-key <key>        API key; prefer the DEEPSEEK_API_KEY env var\n\n\
          PLAY MODE (opens default browser):\n\
          \x20   --subtitle <srt|vtt>   subtitle file next to / for the media\n\
          \x20   --no-browser           don't auto-open the browser\n\
@@ -285,6 +294,87 @@ fn resolve_data_dir(explicit: Option<String>) -> std::path::PathBuf {
     PathBuf::from(".sentence-video")
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// agent subcommand — CopilotKit / AG-UI service (Rust port of AI-Demo)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `sentence-video agent [--host <addr>] [--port <n>] [--model <name>] …`
+///
+/// Serves the CopilotKit/AG-UI endpoints that previously needed the Bun
+/// `agent-runtime` *and* the Python `backend` — now one binary.
+/// See [`agent`] for the module layout.
+#[cfg(feature = "agent")]
+fn run_agent_command(args: &[String]) {
+    let mut cfg = agent::AgentConfig::from_env();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    cfg.host = v.clone();
+                }
+            }
+            "--port" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    cfg.port = v.parse().unwrap_or(cfg.port);
+                }
+            }
+            "--model" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    cfg.model = v.clone();
+                }
+            }
+            "--agent-id" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    cfg.agent_id = v.clone();
+                }
+            }
+            "--catalog-id" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    cfg.catalog_id = v.clone();
+                }
+            }
+            "--max-steps" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    cfg.max_steps = v.parse().unwrap_or(cfg.max_steps);
+                }
+            }
+            "--api-key" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    cfg.api_key = v.clone();
+                }
+            }
+            other => eprintln!("sentence-video agent: ignoring unknown argument '{other}'"),
+        }
+        i += 1;
+    }
+
+    if let Err(e) = agent::run(cfg) {
+        eprintln!("sentence-video agent: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Without the `agent` feature the subcommand still exists, so the CLI can say
+/// exactly how to get it back instead of failing with "unknown argument".
+#[cfg(not(feature = "agent"))]
+fn run_agent_command(_args: &[String]) {
+    eprintln!(
+        "sentence-video: the agent service is not compiled in.\n\
+         Rebuild with the 'agent' feature (enabled by default):\n\
+         \x20 cargo build --release --features agent"
+    );
+    std::process::exit(1);
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -298,6 +388,11 @@ fn main() {
     if args.first().map(String::as_str) == Some("dub") {
         args.remove(0);
         run_dub(&args);
+        return;
+    }
+    if args.first().map(String::as_str) == Some("agent") {
+        args.remove(0);
+        run_agent_command(&args);
         return;
     }
 
