@@ -714,7 +714,7 @@ pure Rust and with no models at all:
 | Piece | Where | Notes |
 | --- | --- | --- |
 | `Word`, `Cue`, `Session` | `rust/src/models.rs` | `Cue { index, start, end, text, words[], source_path }`, `Word { text, start, end, score }` |
-| `build_cues(words, duration)` | `rust/src/pipeline/transcribe.rs` | word → sentence grouper; port of Python `cue_builder.py`; `MAX_CUE_SECS = 12.0`, `MAX_CUE_WORDS = 40` |
+| `build_cues(words, duration, media_path)` | `rust/src/pipeline/transcribe.rs` | word → sentence grouper; splits **only** at sentence-final punctuation (no duration/word cap, so cues are always complete sentences) |
 | `is_sentence_end(word)` | `rust/src/segmenter.rs` | sentence-final `.` / `!` / `?` test |
 | `finalize(cues, duration, path)` | `rust/src/segmenter.rs` | re-indexes, clamps times, fills `words` and `source_path` |
 | `transcribe_words(media)` | `rust/src/pipeline/transcribe.rs` | **stub** — returns a descriptive error until an ASR backend is bound |

@@ -103,17 +103,27 @@ pub fn render(operations: Vec<Value>) -> Value {
     Value::Array(operations)
 }
 
+/// The container key the frontend looks for inside an `ACTIVITY_SNAPSHOT`
+/// `content` object.
+///
+/// Must match `A2UI_OPERATIONS_KEY` in `@copilotkit/react-core`'s
+/// `A2UIMessageRenderer` and `copilotkit.a2ui` (Python): the renderer reads
+/// `content["a2ui_operations"]` and shows its "building" skeleton for any other
+/// key, so a payload stored under a different name renders nothing.
+pub const A2UI_OPERATIONS_KEY: &str = "a2ui_operations";
+
 /// Build the `content` object of an AG-UI `ACTIVITY_SNAPSHOT` carrying A2UI.
 ///
 /// AG-UI requires the activity payload to be a JSON **object**
 /// (`ag_ui::Event::activity_snapshot` takes a [`JsonObject`]), whereas A2UI
-/// operations are an **array**. They therefore ride under `operations`, with the
-/// tool that produced them recorded next to them — which is what makes a
-/// mis-rendered surface traceable in the browser.
+/// operations are an **array**. They therefore ride under
+/// [`A2UI_OPERATIONS_KEY`] — the key the renderer actually reads — with the tool
+/// that produced them recorded alongside, which is what makes a mis-rendered
+/// surface traceable in the browser.
 pub fn activity_content(tool_name: &str, operations: Value) -> JsonObject {
     let mut content = JsonObject::new();
+    content.insert(A2UI_OPERATIONS_KEY.to_string(), operations);
     content.insert("tool".to_string(), Value::String(tool_name.to_string()));
-    content.insert("operations".to_string(), operations);
     content
 }
 

@@ -124,6 +124,40 @@ fn parse_time_line(line: &str) -> Result<(f64, f64), String> {
     Ok((start, end))
 }
 
+/// Format seconds as an SRT timestamp (`HH:MM:SS,mmm`).
+pub fn format_timestamp(secs: f64) -> String {
+    let total_ms = (secs.max(0.0) * 1000.0).round() as u64;
+    let total_secs = total_ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        total_secs / 3600,
+        (total_secs / 60) % 60,
+        total_secs % 60,
+        total_ms % 1000
+    )
+}
+
+/// Write sentence cues as an `.srt` file.
+///
+/// Written to a sibling `.tmp` file and renamed, so an interrupted run can
+/// never leave a half-written subtitle next to the media.
+pub fn write_srt(cues: &[Cue], path: &str) -> Result<(), String> {
+    let mut out = String::new();
+    for (i, cue) in cues.iter().enumerate() {
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            i + 1,
+            format_timestamp(cue.start),
+            format_timestamp(cue.end),
+            cue.text.trim()
+        ));
+    }
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, out).map_err(|e| format!("cannot write {tmp}: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot write {path}: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +174,42 @@ mod tests {
         let (s, e) = parse_time_line("00:00:01.000 --> 00:00:03.500 align:start").unwrap();
         assert!((s - 1.0).abs() < 1e-6);
         assert!((e - 3.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn formats_and_round_trips_srt() {
+        assert_eq!(format_timestamp(62.5), "00:01:02,500");
+        assert_eq!(format_timestamp(3661.007), "01:01:01,007");
+
+        let cues = vec![
+            Cue {
+                index: 0,
+                start: 0.5,
+                end: 2.0,
+                text: "Hello world.".into(),
+                words: Vec::new(),
+                source_path: None,
+            },
+            Cue {
+                index: 1,
+                start: 2.5,
+                end: 4.25,
+                text: "Second line.".into(),
+                words: Vec::new(),
+                source_path: None,
+            },
+        ];
+        let dir = std::env::temp_dir().join(format!("sv-srt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.srt");
+        let path_s = path.to_string_lossy().into_owned();
+        write_srt(&cues, &path_s).unwrap();
+
+        let parsed = parse_subtitle(&path_s).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].text, "Hello world.");
+        assert!((parsed[0].start - 0.5).abs() < 1e-6);
+        assert!((parsed[1].end - 4.25).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -17,15 +17,11 @@ use std::path::Path;
 
 use crate::media;
 use crate::models::{Cue, Word};
+use crate::pipeline::checkpoint;
 use crate::segmenter;
 use crate::subtitle;
 
 pub use crate::segmenter::is_sentence_end;
-
-/// Grouping limits mirrored from Python's `cue_builder` so sentences never
-/// grow unbounded in duration or word count.
-const MAX_CUE_SECS: f64 = 12.0;
-const MAX_CUE_WORDS: usize = 40;
 
 /// Build a sentence-sized `Cue` from a run of words.
 fn make_cue(index: usize, words: &[Word]) -> Cue {
@@ -34,10 +30,7 @@ fn make_cue(index: usize, words: &[Word]) -> Cue {
         .map(|w| w.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    let start = words
-        .first()
-        .map(|w| w.start)
-        .unwrap_or(0.0);
+    let start = words.first().map(|w| w.start).unwrap_or(0.0);
     let end = words.iter().map(|w| w.end).fold(start, f64::max);
     Cue {
         index,
@@ -50,9 +43,15 @@ fn make_cue(index: usize, words: &[Word]) -> Cue {
 }
 
 /// Group word-level timings into sentence cues, ported from Python's
-/// `cue_builder.build_aligned_cues`. Words accumulate until a sentence-final
-/// punctuation mark, too many words, or too long a span — whichever comes
-/// first. Output is sample-clamped via [`segmenter::finalize`].
+/// `cue_builder.build_aligned_cues`.
+///
+/// Words accumulate until a **sentence-final punctuation mark**, so a cue is
+/// always a complete sentence however long it runs. There is deliberately no
+/// duration or word-count cap: those split sentences mid-thought (e.g. a 12 s
+/// limit cutting "...powering today's" from "most dynamic data architectures").
+/// Any trailing words at the end of the audio form a final cue.
+///
+/// Output is sample-clamped via [`segmenter::finalize`].
 pub fn build_cues(words: &[Word], media_duration: f64, media_path: &str) -> Vec<Cue> {
     let mut cues: Vec<Cue> = Vec::new();
     let mut current: Vec<Word> = Vec::new();
@@ -69,16 +68,7 @@ pub fn build_cues(words: &[Word], media_duration: f64, media_path: &str) -> Vec<
         }
         current.push(word.clone());
 
-        let start = current
-            .first()
-            .map(|w| w.start)
-            .unwrap_or(0.0);
-        let end = word.end;
-        let too_long = (end - start) > MAX_CUE_SECS;
-        let too_many = current.len() >= MAX_CUE_WORDS;
-        let finally_sentence = open_parens <= 0 && is_sentence_end(&word.text);
-
-        if too_long || too_many || finally_sentence {
+        if open_parens <= 0 && is_sentence_end(&word.text) {
             cues.push(make_cue(cues.len(), &current));
             current.clear();
             open_parens = 0;
@@ -115,97 +105,321 @@ pub struct Transcript {
     pub duration_secs: f64,
 }
 
+/// Which stage of a session build is running right now.
+///
+/// Building a session is **synchronous** — the session row only reaches the
+/// database when it ends — so without this a caller cannot tell the slow part
+/// (whisper, then wav2vec2 alignment, which is minutes per video) from a hang:
+/// the video is not in the session list yet and no endpoint knows it is being
+/// worked on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStage {
+    /// Decoding the audio to 16 kHz mono for the model.
+    Decode,
+    /// Whisper transcribes the whole buffer in one call, so there is no
+    /// sub-progress to report — only that this is the current stage.
+    Transcribe,
+    /// Wav2vec2 forced alignment, window by window. Alignment dominates the
+    /// cost of a build, so this is the one stage where a bar is worth drawing.
+    Align { done: usize, total: usize },
+}
+
+/// The error a build unwinds with when the user cancelled it. Matched by the
+/// HTTP layer, which reports it as "cancelled" instead of as a failed
+/// transcription — the user asked for it, so it is not a failure.
+pub const CANCELLED: &str = "cancelled by the user";
+
+/// Receives [`BuildStage`] updates during a build and answers "keep going?".
+///
+/// The return value is how cancellation reaches the pipeline. A build is minutes
+/// of CPU inside one request, so there is no other moment to ask: whoever owns
+/// the sink also owns the button, and every stage boundary is already a place
+/// where the build reports — folding the check into the same call means no
+/// second parameter has to be threaded down to the aligner.
+///
+/// `Sync` because alignment spreads its windows over several threads and every
+/// window reports its own completion.
+pub type BuildSink<'a> = Option<&'a (dyn Fn(BuildStage) -> bool + Sync)>;
+
+/// Report a stage when a sink is attached, failing the build if it says stop.
+///
+/// Checked at stage boundaries only, which is what can be checked: whisper
+/// transcribes the whole buffer in one call and cannot be interrupted, so a
+/// cancel during transcription takes effect when it returns.
+fn report(sink: BuildSink<'_>, stage: BuildStage) -> Result<(), String> {
+    match sink {
+        Some(sink) if !sink(stage) => Err(CANCELLED.to_string()),
+        _ => Ok(()),
+    }
+}
+
 /// From-audio entry point: transcribe the media's audio into word timings.
 ///
 /// Decodes the audio to 16 kHz mono with the in-process FFmpeg layer, then runs
 /// whisper.cpp (see [`crate::asr`]). The model is embedded in the executable, so
 /// no external files are needed; `--asr-model <path>` overrides it.
-pub fn transcribe_words(media_path: &str) -> Result<Transcript, String> {
+pub fn transcribe_words(media_path: &str, align: bool) -> Result<Transcript, String> {
     let cfg = crate::asr::config();
-    transcribe_words_with(media_path, cfg.model.as_deref(), cfg.language.as_deref())
+    transcribe_words_with(
+        media_path,
+        cfg.model.as_deref(),
+        cfg.language.as_deref(),
+        align,
+        None,
+        None,
+    )
 }
 
-/// [`transcribe_words`] with an explicit model and language.
+/// [`transcribe_words`] with an explicit model, language, alignment choice, and
+/// an optional checkpoint directory.
+///
+/// With `checkpoint` set, `words.json` inside it holds the raw whisper word
+/// timings and `align/w{first}-{last}.json` holds each refined alignment window
+/// (see [`crate::align::refine_words`]). A re-run therefore skips whisper when
+/// the raw words are already there, and skips every alignment window already
+/// computed — which is the expensive part. **Whisper itself is not resumable**:
+/// it transcribes the whole buffer in one call, so the raw-words file buys the
+/// single boundary "ASR finished, alignment/dubbing interrupted".
 pub fn transcribe_words_with(
     media_path: &str,
     model: Option<&Path>,
     language: Option<&str>,
+    align: bool,
+    checkpoint: Option<&Path>,
+    progress: BuildSink<'_>,
 ) -> Result<Transcript, String> {
-    if !crate::asr::model_available(model) {
-        return Err(crate::asr::NO_MODEL_HELP.to_string());
-    }
     let duration_secs = media::probe_duration(media_path).unwrap_or(0.0);
-    let (samples, _channels) = media::decode_to_f32(media_path, crate::asr::SAMPLE_RATE, true, None)?;
-    if samples.is_empty() {
-        return Err(format!("no audio track could be decoded from '{media_path}'"));
-    }
-    let words = crate::asr::transcribe(&samples, model, language)?;
-    Ok(Transcript { words, duration_secs })
+
+    let cached: Option<Vec<Word>> =
+        checkpoint.and_then(|dir| checkpoint::read_json::<Vec<Word>>(dir, "words.json"));
+
+    let (samples, words) = match cached.filter(|w| !w.is_empty()) {
+        Some(words) => {
+            println!(
+                "sentence-video: reusing {} transcribed word(s) from the checkpoint",
+                words.len()
+            );
+            // Only the aligner needs the audio, and decoding it is not free.
+            let samples = if align {
+                report(progress, BuildStage::Decode)?;
+                media::decode_to_f32(media_path, crate::asr::SAMPLE_RATE, true, None)?.0
+            } else {
+                Vec::new()
+            };
+            (samples, words)
+        }
+        None => {
+            if !crate::asr::model_available(model) {
+                return Err(crate::asr::NO_MODEL_HELP.to_string());
+            }
+            report(progress, BuildStage::Decode)?;
+            let (samples, _channels) =
+                media::decode_to_f32(media_path, crate::asr::SAMPLE_RATE, true, None)?;
+            if samples.is_empty() {
+                return Err(format!(
+                    "no audio track could be decoded from '{media_path}'"
+                ));
+            }
+            report(progress, BuildStage::Transcribe)?;
+            let words = crate::asr::transcribe(&samples, model, language)?;
+            if let Some(dir) = checkpoint {
+                // Written straight after ASR so an interruption during
+                // alignment does not cost the transcription again.
+                if let Err(e) = checkpoint::write_json(dir, "words.json", &words) {
+                    eprintln!("sentence-video: cannot checkpoint the transcript: {e}");
+                }
+            }
+            (samples, words)
+        }
+    };
+
+    let align_dir = checkpoint.map(|dir| dir.join("align"));
+    let words = refine_timings(&samples, words, align, align_dir.as_deref(), progress)?;
+    Ok(Transcript {
+        words,
+        duration_secs,
+    })
 }
 
-/// Look for an adjacent `<media-basename>.(srt|vtt)` subtitle file.
-pub fn auto_subtitle(media_path: &str) -> Option<String> {
-    let p = Path::new(media_path);
-    let stem = p.with_extension("srt");
-    if stem.exists() {
-        return Some(stem.to_string_lossy().into_owned());
+/// Replace whisper's DTW word timings with wav2vec2 forced alignment.
+///
+/// Every failure here is soft: the alignment is an optional refinement of timings
+/// whisper already produced, so a missing feature, missing weights, or a window
+/// that will not align all fall back to whisper's timings rather than failing the
+/// session. The samples were already decoded for whisper, so this adds no I/O.
+#[cfg(feature = "asr-align")]
+fn refine_timings(
+    samples: &[f32],
+    words: Vec<Word>,
+    align: bool,
+    checkpoint: Option<&Path>,
+    progress: BuildSink<'_>,
+) -> Result<Vec<Word>, String> {
+    use crate::align;
+    if !align {
+        return Ok(words);
     }
-    let stem = p.with_extension("vtt");
-    if stem.exists() {
-        return Some(stem.to_string_lossy().into_owned());
+    let Some(path) = align::default_weights_path() else {
+        eprintln!("sentence-video: {}", align::NO_WEIGHTS_HELP);
+        return Ok(words);
+    };
+    println!(
+        "sentence-video: refining word timings with {} ({} words, {} windows)",
+        path.display(),
+        words.len(),
+        align::plan_windows(&words).len()
+    );
+    let aligner = match align::Aligner::load(&path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sentence-video: cannot load alignment weights: {e}");
+            return Ok(words);
+        }
+    };
+    // The only stage that can be interrupted: it runs window by window, and every
+    // finished window is its own checkpoint — so cancelling here keeps all the
+    // work done so far for the next attempt.
+    let (refined, stats) = align::refine_words(&aligner, samples, words, checkpoint, progress)?;
+    println!(
+        "sentence-video: alignment finished: {} of {} window(s) aligned, {} kept whisper timings",
+        stats.aligned, stats.windows, stats.failed
+    );
+    Ok(refined)
+}
+
+/// Without the feature compiled in, `align` can only be reported, not honoured.
+#[cfg(not(feature = "asr-align"))]
+fn refine_timings(
+    _samples: &[f32],
+    words: Vec<Word>,
+    align: bool,
+    _checkpoint: Option<&Path>,
+    _progress: BuildSink<'_>,
+) -> Result<Vec<Word>, String> {
+    if align {
+        eprintln!(
+            "sentence-video: this build has no wav2vec2 aligner; rebuild with \
+             `cargo build --features asr-align` (keeping whisper timings)"
+        );
+    }
+    Ok(words)
+}
+
+/// Path of the canonical sentence-level subtitle for a media file:
+/// `<dir>/<stem>_full_sentence.srt` (e.g. `lecture.mp4` →
+/// `lecture_full_sentence.srt`). This is where a transcription is saved so the
+/// next run — and the user — can reuse or edit it.
+pub fn sentence_subtitle_path(media_path: &str) -> String {
+    let p = Path::new(media_path);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = p.parent().unwrap_or_else(|| Path::new(""));
+    dir.join(format!("{stem}_full_sentence.srt"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Locate an existing subtitle **without transcribing anything**:
+///
+/// 1. the explicitly supplied path, else
+/// 2. `<stem>_full_sentence.srt` next to the media.
+///
+/// A legacy adjacent `<stem>.srt` / `<stem>.vtt` is deliberately **not** used:
+/// the canonical file is always the source of truth, so a missing one triggers
+/// transcription rather than silently adopting an unrelated subtitle.
+///
+/// `None` means "nothing on disk — transcription is required".
+pub fn locate_subtitle(media_path: &str, explicit: Option<&str>) -> Option<String> {
+    if let Some(path) = explicit {
+        return Some(path.to_string());
+    }
+    let canonical = sentence_subtitle_path(media_path);
+    if Path::new(&canonical).is_file() {
+        return Some(canonical);
     }
     None
 }
 
-/// Best-effort cue source for a media file:
+/// Parse a subtitle file into finalized sentence cues.
+pub fn cues_from_subtitle(path: &str, media_path: &str) -> Result<Vec<Cue>, String> {
+    let mut cues = subtitle::parse_subtitle(path)?;
+    // The parser leaves word timings empty; give each cue a word list so the
+    // shape matches transcription-derived cues.
+    for cue in cues.iter_mut() {
+        if cue.words.is_empty() || cue.words[0].end == 0.0 {
+            cue.words = cue
+                .text
+                .split_whitespace()
+                .map(|w| Word {
+                    text: w.to_string(),
+                    start: 0.0,
+                    end: 0.0,
+                    score: 1.0,
+                })
+                .collect();
+        }
+    }
+    let duration = media::probe_duration(media_path).unwrap_or(0.0);
+    Ok(segmenter::finalize(cues, duration, media_path))
+}
+
+/// Transcribe the media's audio into sentence cues and **save them** as
+/// [`sentence_subtitle_path`], so later runs reuse the file instead of
+/// re-running the model.
 ///
-/// 1. an explicitly supplied subtitle path (parsed + finalized), else
-/// 2. an adjacent `<media>.srt`/`.vtt` auto-detected next to the media, else
-/// 3. **transcription** — the audio is decoded in-process and run through
-///    whisper.cpp ([`transcribe_words`]), then grouped into sentence cues.
+/// `checkpoint` is passed through to [`transcribe_words_with`] so the raw words
+/// and alignment windows survive an interruption.
+///
+/// Returns the cues and the path written (`None` if saving failed — the
+/// transcription itself still succeeds).
+pub fn transcribe_and_save(
+    media_path: &str,
+    align: bool,
+    checkpoint: Option<&Path>,
+    progress: BuildSink<'_>,
+) -> Result<(Vec<Cue>, Option<String>), String> {
+    let cfg = crate::asr::config();
+    let transcript = transcribe_words_with(
+        media_path,
+        cfg.model.as_deref(),
+        cfg.language.as_deref(),
+        align,
+        checkpoint,
+        progress,
+    )?;
+    // With alignment off, transcription is the last thing that reports, and the
+    // session is written as soon as this returns — so without a check here a
+    // cancel that arrived while whisper ran would still produce a session. (With
+    // alignment on, the aligner's own checks cover the same window.)
+    report(progress, BuildStage::Transcribe)?;
+    if transcript.words.is_empty() {
+        return Err(format!("speech-to-text found no words in '{media_path}'"));
+    }
+    let cues = build_cues(&transcript.words, transcript.duration_secs, media_path);
+    let out = sentence_subtitle_path(media_path);
+    match subtitle::write_srt(&cues, &out) {
+        Ok(()) => Ok((cues, Some(out))),
+        Err(e) => {
+            // A read-only folder must not fail the session.
+            eprintln!("sentence-video: could not save the transcript: {e}");
+            Ok((cues, None))
+        }
+    }
+}
+
+/// Best-effort cue source for a media file (used by the `dub` pipeline):
+/// an existing subtitle via [`locate_subtitle`], else transcription saved to
+/// `<stem>_full_sentence.srt`.
 pub fn cues_from_media(
     media_path: &str,
     explicit_subtitle: Option<&str>,
+    align: bool,
 ) -> Result<Vec<Cue>, String> {
-    let subtitle_path = explicit_subtitle
-        .map(str::to_string)
-        .or_else(|| auto_subtitle(media_path));
-
-    match subtitle_path {
-        Some(path) => {
-            let mut cues = subtitle::parse_subtitle(&path)?;
-            // Build full word lists for cues parsed from file (parser leaves
-            // them time-less), then clamp timings to the media length.
-            let media_path = String::from(media_path);
-            for cue in cues.iter_mut() {
-                if cue.words.is_empty() || cue.words[0].end == 0.0 {
-                    cue.words = cue
-                        .text
-                        .split_whitespace()
-                        .map(|w| Word {
-                            text: w.to_string(),
-                            start: 0.0,
-                            end: 0.0,
-                            score: 1.0,
-                        })
-                        .collect();
-                }
-            }
-            let duration = media::probe_duration(&media_path).unwrap_or(0.0);
-            Ok(segmenter::finalize(cues, duration, &media_path))
-        }
-        None => {
-            // No subtitle anywhere: derive the sentence list from the audio.
-            let transcript = transcribe_words(media_path)?;
-            if transcript.words.is_empty() {
-                return Err(format!("speech-to-text found no words in '{media_path}'"));
-            }
-            Ok(build_cues(
-                &transcript.words,
-                transcript.duration_secs,
-                media_path,
-            ))
-        }
+    match locate_subtitle(media_path, explicit_subtitle) {
+        Some(path) => cues_from_subtitle(&path, media_path),
+        None => transcribe_and_save(media_path, align, None, None).map(|(cues, _)| cues),
     }
 }
 
@@ -216,10 +430,30 @@ mod tests {
     #[test]
     fn groups_words_into_sentences_at_punctuation() {
         let words = [
-            Word { text: "Hello".into(), start: 0.0, end: 0.5, score: 1.0 },
-            Word { text: "world.".into(), start: 0.5, end: 1.0, score: 1.0 },
-            Word { text: "Next".into(), start: 2.0, end: 2.5, score: 1.0 },
-            Word { text: "sentence!".into(), start: 2.5, end: 3.0, score: 1.0 },
+            Word {
+                text: "Hello".into(),
+                start: 0.0,
+                end: 0.5,
+                score: 1.0,
+            },
+            Word {
+                text: "world.".into(),
+                start: 0.5,
+                end: 1.0,
+                score: 1.0,
+            },
+            Word {
+                text: "Next".into(),
+                start: 2.0,
+                end: 2.5,
+                score: 1.0,
+            },
+            Word {
+                text: "sentence!".into(),
+                start: 2.5,
+                end: 3.0,
+                score: 1.0,
+            },
         ];
         let cues = build_cues(&words, 10.0, "/media/sample.mp4");
         assert_eq!(cues.len(), 2);
@@ -230,13 +464,57 @@ mod tests {
     #[test]
     fn keeps_parens_containing_period_inside_one_cue() {
         let words = [
-            Word { text: "See".into(), start: 0.0, end: 0.3, score: 1.0 },
-            Word { text: "(e.g.".into(), start: 0.3, end: 0.6, score: 1.0 },
-            Word { text: "one).".into(), start: 0.6, end: 1.0, score: 1.0 },
-            Word { text: "Next.".into(), start: 1.5, end: 2.0, score: 1.0 },
+            Word {
+                text: "See".into(),
+                start: 0.0,
+                end: 0.3,
+                score: 1.0,
+            },
+            Word {
+                text: "(e.g.".into(),
+                start: 0.3,
+                end: 0.6,
+                score: 1.0,
+            },
+            Word {
+                text: "one).".into(),
+                start: 0.6,
+                end: 1.0,
+                score: 1.0,
+            },
+            Word {
+                text: "Next.".into(),
+                start: 1.5,
+                end: 2.0,
+                score: 1.0,
+            },
         ];
         let cues = build_cues(&words, 10.0, "/media/sample.mp4");
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "See (e.g. one).");
+    }
+
+    /// Regression: a long sentence must stay **one** cue. A former 12-second /
+    /// 40-word cap sliced sentences mid-thought (e.g. ending a cue on
+    /// "...powering today's" instead of at the next full stop).
+    #[test]
+    fn long_sentence_is_not_split_by_a_length_cap() {
+        let mut words: Vec<Word> = (0..60)
+            .map(|i| Word {
+                text: format!("word{i}"),
+                start: i as f64 * 0.7,
+                end: i as f64 * 0.7 + 0.6,
+                score: 1.0,
+            })
+            .collect();
+        words.last_mut().unwrap().text = "end.".to_string();
+
+        let span = words.last().unwrap().end - words[0].start;
+        assert!(span > 12.0, "test needs a >12s run, got {span}s");
+        assert!(words.len() > 40, "test needs >40 words");
+
+        let cues = build_cues(&words, 120.0, "/media/sample.mp4");
+        assert_eq!(cues.len(), 1, "a complete sentence must not be split");
+        assert!(cues[0].text.ends_with("end."));
     }
 }

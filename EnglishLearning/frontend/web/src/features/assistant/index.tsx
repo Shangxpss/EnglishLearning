@@ -4,7 +4,7 @@ import { CopilotChat } from "@copilotkit/react-core/v2";
  * AI Assistant page.
  *
  * Mirrors AI-Demo/front/src/Chat.tsx. Renders a full-height CopilotChat
- * panel that talks to the english_pro_agent via the agent-runtime.
+ * panel that talks to the `sample_agent` exposed by the Rust agent service.
  *
  * The CopilotKit provider (which supplies runtimeUrl, agent id, and the
  * A2UI catalog) is mounted at the app root in providers/index.tsx, so
@@ -26,7 +26,7 @@ export function AssistantPage() {
       <div className="flex justify-center items-stretch h-[70vh] w-full">
         <div className="h-full w-full max-w-4xl">
           <CopilotChat
-            agentId="english_pro_agent"
+            agentId="sample_agent"
             className="h-full rounded-2xl border bg-card shadow-sm"
             labels={{
               title: "EnglishPro Assistant",

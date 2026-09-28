@@ -13,6 +13,10 @@
 // `src/agent/` tree is silently never compiled, and `agent::…` fails to resolve.
 #[cfg(feature = "agent")]
 mod agent;
+// wav2vec2 forced alignment: experimental, off by default, and the only module
+// that reads a multi-hundred-MB model from disk instead of embedding it.
+#[cfg(feature = "asr-align")]
+mod align;
 mod app;
 mod asr;
 mod db;
@@ -20,11 +24,14 @@ mod media;
 mod models;
 mod picker;
 mod pipeline;
+mod platform;
 mod segmenter;
 mod server;
 mod subtitle;
 
 use std::sync::Arc;
+
+use ffmpeg_next::ffi::fprintf;
 
 const MEDIA_EXTS: &[&str] = &[
     "mp4", "mkv", "mov", "webm", "m4a", "mp3", "wav", "ogg", "aac",
@@ -37,7 +44,8 @@ fn print_usage() {
          \x20 sentence-video [serve] <media-file> [OPTIONS]\n\
          \x20 sentence-video replace-audio <video> <audio> <output> [--bitrate <bps>] [--full]\n\
          \x20 sentence-video dub <video> <output> [--subtitle <srt>|<vtt>] [OPTIONS]\n\
-         \x20 sentence-video agent [--host <addr>] [--port <n>] [OPTIONS]\n\n\
+         \x20 sentence-video agent [--host <addr>] [--port <n>] [OPTIONS]\n\
+         \x20 sentence-video align <media> [--transcript <text|file>] [OPTIONS]\n\n\
          AGENT MODE (CopilotKit / AG-UI service; replaces the AI-Demo Bun runtime + Python backend):\n\
          \x20   --host <addr>          bind address (default 127.0.0.1)\n\
          \x20   --port <n>             bind port (default 4000)\n\
@@ -54,7 +62,16 @@ fn print_usage() {
          \x20   --data-dir <path>      folder for the SQLite session database\n\
          \x20   --asr-model <path>     speech-to-text model file\n\
          \x20                         (default: the model embedded in this binary)\n\
-         \x20   --asr-language <code>  spoken language for transcription (default: en)\n\n\
+         \x20   --asr-language <code>  spoken language for transcription (default: en)\n\
+         \x20   --align                refine word timings with wav2vec2 forced alignment\n\
+         \x20                         (needs the weights; also SENTENCE_VIDEO_ALIGN=1)\n\
+         \x20   --dub-engine <name>    TTS backend for the 'Dub audio' option:\n\
+         \x20                         edge-tts (default) | espeak-ng | silence\n\
+         \x20                         (also SENTENCE_VIDEO_DUB_ENGINE)\n\
+         \x20   --dub-voice <name>     voice for that backend; default en-GB-MaisieNeural\n\
+         \x20                         for edge-tts (also SENTENCE_VIDEO_DUB_VOICE)\n\
+         \x20   --dub-proxy <url>      proxy for edge-tts, which ignores https_proxy\n\
+         \x20                         (also SENTENCE_VIDEO_DUB_PROXY)\n\n\
          REPLACE-AUDIO (batch, replaces a video's audio with a supplied track):\n\
          \x20   <video>    media whose audio will be replaced\n\
          \x20   <audio>    new audio track (mp3/wav/m4a/…)\n\
@@ -196,11 +213,32 @@ fn run_dub(args: &[String]) {
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
-            "--subtitle" => { i += 1; subtitle = args.get(i).cloned(); }
-            "--voice" => { i += 1; voice = args.get(i).cloned(); }
-            "--tts-command" => { i += 1; if let Some(v) = args.get(i) { tts_command = v.clone(); } }
-            "--voice-rate" => { i += 1; if let Some(v) = args.get(i) { voice_rate = v.parse().unwrap_or(voice_rate); } }
-            "--bitrate" => { i += 1; if let Some(v) = args.get(i) { bitrate = v.parse().unwrap_or(bitrate); } }
+            "--subtitle" => {
+                i += 1;
+                subtitle = args.get(i).cloned();
+            }
+            "--voice" => {
+                i += 1;
+                voice = args.get(i).cloned();
+            }
+            "--tts-command" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    tts_command = v.clone();
+                }
+            }
+            "--voice-rate" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    voice_rate = v.parse().unwrap_or(voice_rate);
+                }
+            }
+            "--bitrate" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    bitrate = v.parse().unwrap_or(bitrate);
+                }
+            }
             "--full" => full = true,
             "--keep-wav" => keep_wav = true,
             "--silence" => use_silence = true,
@@ -271,6 +309,11 @@ fn run_dub(args: &[String]) {
             std::process::exit(1);
         }
     }
+}
+
+/// An environment variable as a non-empty string, if it is set.
+fn env_setting(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 /// Where the SQLite session database lives. Priority: `--data-dir`, then the
@@ -380,6 +423,199 @@ fn run_agent_command(_args: &[String]) {
     std::process::exit(1);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// align subcommand — wav2vec2 forced alignment (feature `asr-align`)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `sentence-video align <media> [--transcript <text|file>] [--align-model <path>]
+///                     [--start <n>] [--max-seconds <n>]`
+///
+/// Diagnostics entry point for the wav2vec2 aligner: with no transcript it
+/// greedy-decodes the audio (does the encoder hear the right words?), and with
+/// one it prints word timings. The window is `--start` (default 0) for
+/// `--max-seconds`, because self-attention is quadratic and this implementation
+/// is single-threaded. Reported times are absolute on the media timeline, so a
+/// window can be compared directly against a subtitle.
+#[cfg(feature = "asr-align")]
+fn run_align_command(args: &[String]) {
+    use std::path::PathBuf;
+
+    let mut media_path: Option<String> = None;
+    let mut transcript: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut start_seconds = 0.0f64;
+    let mut max_seconds = 30.0f64;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--transcript" => {
+                i += 1;
+                transcript = args.get(i).cloned();
+            }
+            "--align-model" => {
+                i += 1;
+                model = args.get(i).cloned();
+            }
+            "--start" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    start_seconds = v.parse().unwrap_or(start_seconds);
+                }
+            }
+            "--max-seconds" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    max_seconds = v.parse().unwrap_or(max_seconds);
+                }
+            }
+            other => {
+                if media_path.is_none() && !other.starts_with('-') {
+                    media_path = Some(other.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let Some(media_path) = media_path else {
+        eprintln!(
+            "sentence-video: align requires a media file\n\n\
+             sentence-video align <media> [--transcript <text|file>] [--align-model <path>]\n\
+             \x20   [--start <n>] [--max-seconds <n>]\n\n\
+             \x20 --transcript   words to align against (inline text, or a file to read);\n\
+             \x20                omitted → greedy-decode the audio instead\n\
+             \x20 --align-model  wav2vec2-base-960h.safetensors (default: auto-detected)\n\
+             \x20 --start        offset of the window in seconds (default 0)\n\
+             \x20 --max-seconds  length of the window in seconds (default 30)"
+        );
+        std::process::exit(1);
+    };
+    let media_path = media::normalize_path(&media_path);
+
+    let weights: PathBuf = match model {
+        Some(p) => PathBuf::from(media::normalize_path(&p)),
+        None => match align::default_weights_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("sentence-video: {}", align::NO_WEIGHTS_HELP);
+                std::process::exit(1);
+            }
+        },
+    };
+    println!("sentence-video: alignment weights → {}", weights.display());
+
+    let aligner = match align::Aligner::load(&weights) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sentence-video: cannot load alignment weights: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // `decode_to_f32` only takes a leading budget, so decode as far as the end of
+    // the window and drop the part before it. Decoding is cheap next to the
+    // encoder, so re-decoding the prefix costs nothing measurable.
+    let (mut samples, _channels) = match media::decode_to_f32(
+        &media_path,
+        align::wav2vec2::SAMPLE_RATE,
+        true,
+        Some(start_seconds + max_seconds),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sentence-video: cannot decode '{media_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+    let skip =
+        ((start_seconds * align::wav2vec2::SAMPLE_RATE as f64).round() as usize).min(samples.len());
+    samples.drain(..skip);
+    println!(
+        "sentence-video: window {:.3}–{:.3}s ({} samples) from {media_path}",
+        start_seconds,
+        start_seconds + samples.len() as f64 / align::wav2vec2::SAMPLE_RATE as f64,
+        samples.len()
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = match transcript.as_deref() {
+        Some(t) => {
+            // A value naming an existing file is read as the transcript.
+            let text = if std::path::Path::new(t).is_file() {
+                match std::fs::read_to_string(t) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        eprintln!("sentence-video: cannot read transcript {t}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                t.to_string()
+            };
+            let words: Vec<&str> = text.split_whitespace().collect();
+            println!("sentence-video: aligning {} words", words.len());
+            aligner.align(&samples, &words).map(Alignment::Words)
+        }
+        None => {
+            println!("sentence-video: no transcript given — greedy decoding instead");
+            aligner.transcribe(&samples).map(Alignment::Text)
+        }
+    };
+
+    match outcome {
+        Ok(Alignment::Words(mut words)) => {
+            // The aligner reports times relative to the window; add the offset
+            // back so every printed time is absolute on the media timeline.
+            for w in words.iter_mut() {
+                w.start += start_seconds;
+                w.end += start_seconds;
+            }
+            for w in &words {
+                println!(
+                    "{:8.3} {:8.3}  {}  [score {:.2}]",
+                    w.start, w.end, w.text, w.score
+                );
+            }
+            println!(
+                "sentence-video: {} words in {:.1}s",
+                words.len(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(Alignment::Text(text)) => {
+            println!("{text}");
+            println!(
+                "sentence-video: decoded in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Err(e) => {
+            eprintln!("sentence-video: alignment failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The two things `align` can produce, so one `match` can format either.
+#[cfg(feature = "asr-align")]
+enum Alignment {
+    Words(Vec<models::Word>),
+    Text(String),
+}
+
+/// Without the feature the subcommand still exists, so the CLI can say exactly
+/// how to get it back instead of failing with "unknown argument".
+#[cfg(not(feature = "asr-align"))]
+fn run_align_command(_args: &[String]) {
+    eprintln!(
+        "sentence-video: wav2vec2 forced alignment is not compiled in.\n\
+         Rebuild with the 'asr-align' feature (it needs the weights on disk):\n\
+         \x20 cargo build --release --features asr-align"
+    );
+    std::process::exit(1);
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -398,6 +634,11 @@ fn main() {
     if args.first().map(String::as_str) == Some("agent") {
         args.remove(0);
         run_agent_command(&args);
+        return;
+    }
+    if args.first().map(String::as_str) == Some("align") {
+        args.remove(0);
+        run_align_command(&args);
         return;
     }
 
@@ -423,6 +664,10 @@ fn main() {
     let mut data_dir: Option<String> = None;
     let mut asr_model: Option<std::path::PathBuf> = None;
     let mut asr_language: Option<String> = None;
+    let mut align = false;
+    let mut dub_engine: Option<String> = None;
+    let mut dub_voice: Option<String> = None;
+    let mut dub_proxy: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -451,6 +696,19 @@ fn main() {
                     asr_language = Some(l.clone());
                 }
             }
+            "--align" => align = true,
+            "--dub-engine" => {
+                i += 1;
+                dub_engine = args.get(i).cloned();
+            }
+            "--dub-voice" => {
+                i += 1;
+                dub_voice = args.get(i).cloned();
+            }
+            "--dub-proxy" => {
+                i += 1;
+                dub_proxy = args.get(i).cloned();
+            }
             "--host" => {
                 i += 1;
                 if let Some(h) = args.get(i) {
@@ -477,10 +735,12 @@ fn main() {
     let cache_dir = std::env::temp_dir().join("sentence-video-cache");
     let data_dir = resolve_data_dir(data_dir);
     let db_path = data_dir.join("sessions.db");
-    let db = match db::Db::open(&db_path) {
+    // Which storage engine this is stays entirely here: the rest of the app only
+    // ever sees `dyn Store`, so swapping the backend never touches request code.
+    let db: Arc<dyn db::Store> = match db::Db::open(&db_path) {
         Ok(db) => {
             println!("sentence-video: session database → {}", db_path.display());
-            db
+            Arc::new(db)
         }
         Err(e) => {
             // Degrade gracefully rather than refusing to start: fall back to a
@@ -491,7 +751,7 @@ fn main() {
                 fallback_dir.join("sessions.db").display()
             );
             match db::Db::open(&fallback_dir.join("sessions.db")) {
-                Ok(db) => db,
+                Ok(db) => Arc::new(db),
                 Err(e) => {
                     eprintln!("sentence-video: cannot open a session database: {e}");
                     std::process::exit(1);
@@ -499,11 +759,37 @@ fn main() {
             }
         }
     };
-    let state = Arc::new(app::AppState::new(cache_dir, db));
+    let state = Arc::new(app::AppState::new(cache_dir, data_dir, db));
+
+    // Dubbing: which TTS backend the 'Dub audio' option uses. Flags win, then
+    // the environment, then the built-in default. The engine itself is not
+    // resolved until a session actually asks to be dubbed, so a missing
+    // `edge-tts` never stops the server from starting. Leaving `voice` as
+    // `None` keeps the engine's own default (en-GB Maisie for `edge-tts`).
+    let dub_defaults = pipeline::DubConfig::default();
+    let dub_engine = dub_engine
+        .or_else(|| env_setting("SENTENCE_VIDEO_DUB_ENGINE"))
+        .unwrap_or(dub_defaults.engine);
+    let dub_voice = dub_voice.or_else(|| env_setting("SENTENCE_VIDEO_DUB_VOICE"));
+    let dub_proxy = dub_proxy.or_else(|| env_setting("SENTENCE_VIDEO_DUB_PROXY"));
+    println!("sentence-video: dubbing engine → {dub_engine}");
+    pipeline::init_dub(pipeline::DubConfig {
+        engine: dub_engine,
+        voice: dub_voice,
+        rate_words_per_min: dub_defaults.rate_words_per_min,
+        proxy: dub_proxy,
+    });
 
     // Speech-to-text: the model is embedded in this executable, so a media file
     // with no subtitle can still be segmented. `--asr-model` overrides it.
-    asr::init(asr_model, asr_language);
+    // `--align` (or `SENTENCE_VIDEO_ALIGN=1`) additionally refines the word
+    // timings with wav2vec2 forced alignment.
+    let align = align
+        || matches!(
+            std::env::var("SENTENCE_VIDEO_ALIGN").as_deref(),
+            Ok("1") | Ok("true")
+        );
+    asr::init(asr_model, asr_language, align);
     let asr_cfg = asr::config();
     let asr_model = asr_cfg.model.as_deref();
     if asr::model_available(asr_model) {
@@ -512,12 +798,15 @@ fn main() {
             asr::model_description(asr_model)
         );
     } else {
-        eprintln!("sentence-video: speech-to-text unavailable: {}", asr::NO_MODEL_HELP);
+        eprintln!(
+            "sentence-video: speech-to-text unavailable: {}",
+            asr::NO_MODEL_HELP
+        );
     }
 
     // Auto-create (or resume) a session when a media file was passed in.
     if let Some(mp) = &media_path {
-        match state.build_session(mp, subtitle_path.clone(), false) {
+        match state.build_session(mp, subtitle_path.clone(), false, align) {
             Ok(session) => {
                 println!(
                     "sentence-video: loaded '{}' ({}s, {} sentences)",

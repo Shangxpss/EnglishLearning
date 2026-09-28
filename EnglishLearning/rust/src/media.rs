@@ -9,6 +9,7 @@
 //!   * `decode_segment_wav`— decode a [start,end] slice of a file to a WAV.
 //!   * `mux_video_audio`  — remux a video stream + (AAC-encoded) audio → .mp4.
 
+use ffmpeg_next::error::EAGAIN;
 use ffmpeg_next::format::flag::Flags as OutputFlags;
 use ffmpeg_next::format::sample::Type as SampleType;
 use ffmpeg_next::format::Sample;
@@ -16,7 +17,6 @@ use ffmpeg_next::media::Type as MediaType;
 use ffmpeg_next::software::resampling;
 use ffmpeg_next::util::channel_layout::ChannelLayout;
 use ffmpeg_next::{codec, encoder, format, frame, packet};
-use ffmpeg_next::error::EAGAIN;
 use std::path::Path;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -29,11 +29,15 @@ fn ff_err(e: ffmpeg_next::Error) -> String {
     media_err(&e.to_string())
 }
 
-fn ff_input(path: &str) -> std::result::Result<ffmpeg_next::format::context::Input, ffmpeg_next::Error> {
+fn ff_input(
+    path: &str,
+) -> std::result::Result<ffmpeg_next::format::context::Input, ffmpeg_next::Error> {
     format::input(&std::path::PathBuf::from(path))
 }
 
-fn ff_output(path: &str) -> std::result::Result<ffmpeg_next::format::context::Output, ffmpeg_next::Error> {
+fn ff_output(
+    path: &str,
+) -> std::result::Result<ffmpeg_next::format::context::Output, ffmpeg_next::Error> {
     format::output(&std::path::PathBuf::from(path))
 }
 
@@ -176,9 +180,7 @@ pub fn decode_to_f32(
                     }
                 }
                 Err(ffmpeg_next::Error::Eof) => break,
-                Err(ffmpeg_next::Error::Other { errno })
-                    if errno == EAGAIN =>
-                {
+                Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => {
                     break;
                 }
                 Err(e) => return Err(ff_err(e)),
@@ -201,9 +203,7 @@ pub fn decode_to_f32(
                     }
                 }
                 Err(ffmpeg_next::Error::Eof) => break,
-                Err(ffmpeg_next::Error::Other { errno })
-                    if errno == EAGAIN =>
-                {
+                Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => {
                     break;
                 }
                 Err(e) => return Err(ff_err(e)),
@@ -326,13 +326,12 @@ pub fn mux_video_audio(
     }
 
     let mut octx = ff_output(output_path).map_err(ff_err)?;
-    let global = octx
-        .format()
-        .flags()
-        .contains(OutputFlags::GLOBAL_HEADER);
+    let global = octx.format().flags().contains(OutputFlags::GLOBAL_HEADER);
 
     // Video stream: copy (no transcode).
-    let mut vout = octx.add_stream(encoder::find(codec::Id::None)).map_err(ff_err)?;
+    let mut vout = octx
+        .add_stream(encoder::find(codec::Id::None))
+        .map_err(ff_err)?;
     vout.set_parameters(vstream.parameters());
     unsafe {
         (*vout.parameters().as_mut_ptr()).codec_tag = 0;
@@ -417,6 +416,90 @@ pub fn mux_video_audio(
 
     octx.write_trailer().map_err(ff_err)?;
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// codec probing + browser-playable transcoding
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Codec name of the first stream of `kind` (`"h264"`, `"hevc"`, …), or `None`
+/// when the file has no stream of that kind.
+fn stream_codec(path: &str, kind: MediaType) -> Result<Option<String>> {
+    init()?;
+    let input = ff_input(path).map_err(ff_err)?;
+    let Some(stream) = input.streams().best(kind) else {
+        return Ok(None);
+    };
+    let ctx = codec::Context::from_parameters(stream.parameters()).map_err(ff_err)?;
+    Ok(Some(ctx.id().name().to_string()))
+}
+
+/// Codec of the file's first video stream; `None` for audio-only media.
+pub fn video_codec(path: &str) -> Result<Option<String>> {
+    stream_codec(path, MediaType::Video)
+}
+
+fn audio_codec(path: &str) -> Result<Option<String>> {
+    stream_codec(path, MediaType::Audio)
+}
+
+/// Whether a browser can be expected to play this video codec.
+///
+/// Chromium (Linux and most desktop builds) decodes H.264 and the royalty-free
+/// codecs, but **not** HEVC/H.265 — the usual output of screen recorders and
+/// course exports. A file whose video is H.265 loads (duration, seeking and
+/// audio all work) yet paints nothing, so it must be re-encoded to be watchable.
+pub fn browser_playable_video_codec(name: &str) -> bool {
+    matches!(name, "h264" | "av1" | "vp8" | "vp9")
+}
+
+/// Audio codecs an MP4 container accepts as-is (`-c:a copy`); anything else is
+/// re-encoded to AAC so the mux cannot fail.
+fn mp4_legal_audio_codec(name: &str) -> bool {
+    matches!(name, "aac" | "mp3" | "ac3" | "eac3" | "opus" | "alac")
+}
+
+/// Re-encode `src`'s video to H.264 (so any browser can play it), copying the
+/// audio when MP4 allows it. `max_height` downscales when set (`None` = keep
+/// resolution). Written to a sibling temp file and renamed, so a partially
+/// written or failed run is never served.
+///
+/// Uses the system `ffmpeg` binary: the vendored FFmpeg this crate links
+/// against has no H.264 encoder (that needs libx264).
+pub fn transcode_to_h264(src: &str, dst: &str, max_height: Option<u32>) -> Result<()> {
+    let audio = audio_codec(src)?;
+    let audio_args: Vec<String> = match &audio {
+        Some(name) if mp4_legal_audio_codec(name) => vec!["-c:a".into(), "copy".into()],
+        Some(_) => vec!["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()],
+        None => vec!["-an".into()],
+    };
+
+    let tmp = format!("{dst}.part");
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-nostdin", "-loglevel", "error"])
+        .args(["-i", src])
+        .args(["-map", "0:v:0"])
+        // `?` = optional: keep the audio when the source has any.
+        .args(["-map", "0:a:0?"])
+        .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"])
+        .args(["-pix_fmt", "yuv420p"])
+        .args(&audio_args);
+    if let Some(h) = max_height {
+        // Must precede the output path, or ffmpeg treats it as a second output.
+        cmd.args(["-vf", &format!("scale=-2:{h}")]);
+    }
+    cmd.args(["-sn", "-movflags", "+faststart"])
+        .args(["-f", "mp4", &tmp]);
+
+    let out = cmd
+        .output()
+        .map_err(|e| format!("cannot run ffmpeg: {e} (install it with `apt install ffmpeg`)"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("ffmpeg failed: {}", stderr.trim()));
+    }
+    std::fs::rename(&tmp, dst).map_err(|e| format!("cannot move transcoded file into place: {e}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────

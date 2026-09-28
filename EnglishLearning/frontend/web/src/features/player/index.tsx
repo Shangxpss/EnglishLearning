@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
+import {
+  pickFileOnServer,
+  readError,
+  type DubbingState,
+  type SessionSummary,
+} from '@/lib/server-api';
 
 /**
  * Sentence-segmented player — the page that talks to the Rust
@@ -7,11 +14,21 @@ import { cn } from '@/lib/utils';
  * the Rust binary actually implements:
  *
  *   GET  /api/sessions                             → session summaries
- *   POST /api/session                              { media_path, subtitle_path? }
- *   GET  /api/session/{id}                         → { id, media_path, media_duration, cues[] }
+ *   POST /api/session                              { media_path, subtitle_path?, align?, dub?, dub_engine? }
+ *   GET  /api/session/{id}                         → { id, media_path, media_duration, cues[], dubbed, video }
  *   GET  /api/session/{id}/cues                    → sentence list
  *   GET  /api/session/{id}/media                   → Range-streamed source media
+ *   GET  /api/session/{id}/dubbed-audio            → Range-streamed replacement voice track
  *   GET  /api/session/{id}/audio?start=&end=       → exact WAV slice of a time range
+ *
+ * A session with `dubbed: true` carries a server-generated voice track that
+ * replaces the original audio: the video is muted, the track is played
+ * alongside it, and the two are kept in sync.
+ *
+ * A session whose source video is a codec browsers cannot decode (HEVC/H.265
+ * is common in course exports) reports `video.playable: false`; the server
+ * re-encodes it to H.264 once, and until that copy exists the player shows a
+ * "preparing" placeholder instead of a silent black rectangle.
  *
  * Every other page in this app targets the legacy Python/FastAPI backend, so
  * those routes are hidden from the top nav (but still reachable by URL).
@@ -38,18 +55,21 @@ interface Session {
   media_duration: number;
   source_format: string;
   cues: Cue[];
-}
-
-interface SessionSummary {
-  session_id: string;
-  media_path: string;
-  media_duration: number;
-  cue_count: number;
-  /** Last sentence played, or -1 when the session was never opened. */
-  last_index: number;
-  /** Last playback position in seconds. */
-  position: number;
-  updated_at: number;
+  /** The server generated a replacement voice track for this session. */
+  dubbed?: boolean;
+  /**
+   * The source video stream. `playable: false` means the codec (typically
+   * HEVC/H.265, which Chromium cannot decode) is being re-encoded to H.264 by
+   * the server; the player shows a placeholder until then.
+   */
+  video?: {
+    codec: string | null;
+    playable: boolean;
+    transcode: 'none' | 'idle' | 'running' | 'done' | 'failed';
+    error?: string;
+  };
+  /** How far the server's dubbing job has got (`/dub`). */
+  dubbing?: DubbingState;
 }
 
 /** Persisted "where the user left off" record for a session. */
@@ -70,29 +90,6 @@ function basename(p: string): string {
   return parts[parts.length - 1] || p;
 }
 
-/** The Rust server reports failures as `{ "error": "..." }`. */
-async function readError(resp: Response): Promise<string> {
-  try {
-    const data = await resp.json();
-    return data?.error || data?.message || `HTTP ${resp.status}`;
-  } catch {
-    return `HTTP ${resp.status}`;
-  }
-}
-
-/**
- * Ask the Rust server to open the native OS file dialog on the machine it runs
- * on and hand back the chosen absolute path (browsers hide `input[type=file]`
- * paths for security, so the server must produce the path itself).
- * Returns `null` when the user cancels the dialog.
- */
-async function pickFileOnServer(kind: 'media' | 'subtitle'): Promise<string | null> {
-  const resp = await fetch(`/api/pick-file?kind=${kind}`, { method: 'POST' });
-  if (!resp.ok) throw new Error(await readError(resp));
-  const data: { path: string | null } = await resp.json();
-  return data.path ?? null;
-}
-
 function chipClass(active: boolean): string {
   return cn(
     'rounded-full border px-3 py-1 text-xs font-medium transition-colors',
@@ -110,12 +107,22 @@ export function PlayerPage() {
   const [filter, setFilter] = useState('');
   const [mediaPath, setMediaPath] = useState('');
   const [subtitlePath, setSubtitlePath] = useState('');
+  /** Refine the word timings with wav2vec2 forced alignment (`align` in the POST body). */
+  const [align, setAlign] = useState(false);
+  /** Replace the voice with TTS synthesis (`dub` / `dub_engine` in the POST body). */
+  const [dub, setDub] = useState(false);
+  const [dubEngine, setDubEngine] = useState('edge-tts');
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
-  const [picking, setPicking] = useState<'media' | 'subtitle' | null>(null);
+  const [picking, setPicking] = useState<'media' | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [manageOpen, setManageOpen] = useState(false);
+  /** Session id being deleted, or '*' while deleting everything. */
+  const [deleting, setDeleting] = useState<string | null>(null);
 
   const mediaRef = useRef<HTMLVideoElement | null>(null);
+  /** The replacement voice track, played alongside the muted video. */
+  const dubbedRef = useRef<HTMLAudioElement | null>(null);
   const listRef = useRef<HTMLOListElement | null>(null);
   const activeRef = useRef(-1);
   const loopRef = useRef(false);
@@ -129,6 +136,86 @@ export function PlayerPage() {
   cuesRef.current = cues;
   loopRef.current = loopMode;
   throughRef.current = playThrough;
+
+  /** True when the open session carries a server-generated voice track. */
+  const dubbed = session?.dubbed === true;
+  const sessionKey = session?.id;
+  /** True once the source video can actually be decoded by this browser. */
+  const videoPlayable = session?.video?.playable ?? true;
+  const transcode = session?.video?.transcode ?? 'none';
+  const videoFailed = transcode === 'failed';
+  /** The server is still rendering sentences; `dubbed` flips when it finishes. */
+  const dubbing = session?.dubbing;
+  const dubbingRunning = dubbing?.state === 'running';
+
+  /**
+   * Point the replacement voice track at the open session. The track is a
+   * sibling `Audio` element rather than the video's own audio, so the video is
+   * muted below and the two are driven together.
+   */
+  useEffect(() => {
+    if (!sessionKey || !dubbed) {
+      dubbedRef.current?.pause();
+      dubbedRef.current = null;
+      return;
+    }
+    const track = new Audio(
+      `/api/session/${encodeURIComponent(sessionKey)}/dubbed-audio`
+    );
+    track.preload = 'auto';
+    dubbedRef.current = track;
+    return () => {
+      track.pause();
+      dubbedRef.current = null;
+    };
+  }, [sessionKey, dubbed]);
+
+  /** Silence the original audio while the dubbed track is playing. */
+  useEffect(() => {
+    const m = mediaRef.current;
+    if (m) m.muted = dubbed;
+  }, [dubbed, sessionKey]);
+
+  /**
+   * While there is server-side work in flight — an H.264 re-encode of a source
+   * this browser cannot decode, or a dubbing run — re-read the session every
+   * few seconds so the player can swap in the video and the voice track the
+   * moment they are ready.
+   */
+  const transcodePending = !videoPlayable && !videoFailed;
+  useEffect(() => {
+    if (!sessionKey || (!transcodePending && !dubbingRunning)) return;
+    const t = window.setInterval(() => {
+      void fetch(`/api/session/${encodeURIComponent(sessionKey)}`)
+        .then((resp) => (resp.ok ? resp.json() : null))
+        .then((data: Session | null) => {
+          if (data) setSession(data);
+        })
+        .catch(() => {
+          /* keep polling — the server may just be busy re-encoding */
+        });
+    }, 3000);
+    return () => window.clearInterval(t);
+  }, [sessionKey, transcodePending, dubbingRunning]);
+
+  /**
+   * Mirror the video's transport onto the voice track. `hard` forces the
+   * current time across (after a seek); otherwise only a drift beyond 150 ms
+   * is corrected, so the track is never nudged audibly.
+   */
+  const syncDubbed = useCallback((hard: boolean) => {
+    const m = mediaRef.current;
+    const a = dubbedRef.current;
+    if (!m || !a) return;
+    if (hard || Math.abs(a.currentTime - m.currentTime) > 0.15) {
+      a.currentTime = m.currentTime;
+    }
+    a.playbackRate = m.playbackRate;
+    // The video is muted, so volume must come from the track itself.
+    a.volume = m.volume;
+    if (m.paused) a.pause();
+    else void a.play().catch(() => {});
+  }, []);
 
   /** Apply a restored position as soon as the media can accept a seek. */
   const applyPendingPosition = useCallback(() => {
@@ -210,9 +297,64 @@ export function PlayerPage() {
     [loadSession]
   );
 
+  /** `?session=<id>` lets the Manage page deep-link into one specific session. */
+  const [searchParams] = useSearchParams();
+  const requestedSession = searchParams.get('session');
+
   useEffect(() => {
-    void refreshSessions(true);
-  }, [refreshSessions]);
+    // `?session=<id>` (used by the Manage page's "Open in player") opens that
+    // session; without it the most recently stored one is opened.
+    void refreshSessions(!requestedSession).then(() => {
+      if (requestedSession) void loadSession(requestedSession);
+    });
+  }, [refreshSessions, loadSession, requestedSession]);
+
+  /** Drop the currently open session from the UI (after it was deleted). */
+  const clearOpenSession = useCallback(() => {
+    sessionIdRef.current = null;
+    setSession(null);
+    setCues([]);
+    activeRef.current = -1;
+    setActiveIdx(-1);
+    pendingPositionRef.current = null;
+  }, []);
+
+  /** `DELETE /api/session/{id}` — remove one stored session. */
+  const deleteSession = useCallback(
+    async (id: string) => {
+      setDeleting(id);
+      setError(null);
+      try {
+        const resp = await fetch(`/api/session/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        if (!resp.ok) throw new Error(await readError(resp));
+        if (sessionIdRef.current === id) clearOpenSession();
+        await refreshSessions(false);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setDeleting(null);
+      }
+    },
+    [refreshSessions, clearOpenSession]
+  );
+
+  /** `DELETE /api/sessions` — wipe every stored session. */
+  const deleteAllSessions = useCallback(async () => {
+    setDeleting('*');
+    setError(null);
+    try {
+      const resp = await fetch('/api/sessions', { method: 'DELETE' });
+      if (!resp.ok) throw new Error(await readError(resp));
+      clearOpenSession();
+      await refreshSessions(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleting(null);
+    }
+  }, [refreshSessions, clearOpenSession]);
 
   const playIndex = useCallback(
     (i: number) => {
@@ -240,9 +382,13 @@ export function PlayerPage() {
   }, [saveProgress]);
 
   // Drive single-segment stop, loop, and play-through from the media clock.
+  // Polled at ~20 ms: a coarser timer lets playback run past `cue.end` into the
+  // first word of the next sentence, which is audible as a clipped word.
   useEffect(() => {
     const timer = window.setInterval(() => {
       const m = mediaRef.current;
+      // Keep the replacement voice track locked to the video it replaces.
+      if (m && dubbedRef.current) syncDubbed(false);
       const cs = cuesRef.current;
       const i = activeRef.current;
       if (!m || i < 0 || i >= cs.length) return;
@@ -257,9 +403,9 @@ export function PlayerPage() {
           m.pause();
         }
       }
-    }, 60);
+    }, 20);
     return () => window.clearInterval(timer);
-  }, [playIndex]);
+  }, [playIndex, syncDubbed]);
 
   const createSession = useCallback(
     async (overrideMedia?: string, overrideSubtitle?: string) => {
@@ -272,8 +418,17 @@ export function PlayerPage() {
       setCreating(true);
       setError(null);
       try {
-        const body: Record<string, string> = { media_path: media };
+        const body: Record<string, string | boolean> = { media_path: media };
         if (subtitle) body.subtitle_path = subtitle;
+        // Only ever opts IN: leaving the box unchecked keeps whatever the server
+        // was started with (`--align` / `SENTENCE_VIDEO_ALIGN=1`).
+        if (align) body.align = true;
+        // Same for dubbing: the server synthesises a replacement voice track
+        // and the player uses it instead of the video's own audio.
+        if (dub) {
+          body.dub = true;
+          body.dub_engine = dubEngine;
+        }
         const resp = await fetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -291,7 +446,7 @@ export function PlayerPage() {
         setCreating(false);
       }
     },
-    [mediaPath, subtitlePath, refreshSessions, loadSession]
+    [mediaPath, subtitlePath, align, dub, dubEngine, refreshSessions, loadSession]
   );
 
   /**
@@ -313,20 +468,6 @@ export function PlayerPage() {
       setPicking(null);
     }
   }, [createSession, subtitlePath]);
-
-  /** Optionally narrow the subtitle the server auto-detects next to the video. */
-  const chooseSubtitle = useCallback(async () => {
-    setError(null);
-    setPicking('subtitle');
-    try {
-      const path = await pickFileOnServer('subtitle');
-      if (path) setSubtitlePath(path);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setPicking(null);
-    }
-  }, []);
 
   /**
    * Play one sentence as a server-decoded audio clip. Unlike normal playback
@@ -397,7 +538,14 @@ export function PlayerPage() {
       .filter(({ cue }) => !q || cue.text.toLowerCase().includes(q));
   }, [cues, filter]);
 
-  const mediaSrc = session ? `/api/session/${encodeURIComponent(session.id)}/media` : undefined;
+  // What /media resolves to changes once the server's H.264 copy lands, so the
+  // URL carries the recipe: the browser fetches the copy instead of reusing a
+  // cached response for the original stream it could not decode.
+  const mediaSrc = session
+    ? `/api/session/${encodeURIComponent(session.id)}/media${
+        transcode === 'done' ? '?v=h264' : ''
+      }`
+    : undefined;
   const activeCue = activeIdx >= 0 ? cues[activeIdx] : undefined;
 
   return (
@@ -426,13 +574,42 @@ export function PlayerPage() {
           >
             {picking === 'media' ? 'Waiting for the file dialog…' : '📂 Choose video…'}
           </button>
-          <button
-            onClick={() => void chooseSubtitle()}
-            disabled={picking !== null || creating}
-            className="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
+          <label
+            title="Refine the word timings with wav2vec2 forced alignment. Only applies when the audio is transcribed — an existing <name>_full_sentence.srt is used as-is."
+            className="flex cursor-pointer items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted has-disabled:opacity-50"
           >
-            {picking === 'subtitle' ? 'Waiting for the file dialog…' : 'Subtitle…'}
-          </button>
+            <input
+              type="checkbox"
+              checked={align}
+              onChange={(e) => setAlign(e.target.checked)}
+              disabled={creating || picking !== null}
+              className="h-4 w-4 accent-primary"
+            />
+            Align timings
+          </label>
+          <label
+            title="Synthesise a replacement voice track for this video and play it instead of the original audio. One TTS call per sentence, placed at the sentence's start time and re-synthesised at a faster rate only when it would overlap the next sentence."
+            className="flex cursor-pointer items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted has-disabled:opacity-50"
+          >
+            <input
+              type="checkbox"
+              checked={dub}
+              onChange={(e) => setDub(e.target.checked)}
+              disabled={creating || picking !== null}
+              className="h-4 w-4 accent-primary"
+            />
+            Dub audio
+          </label>
+          <select
+            value={dubEngine}
+            onChange={(e) => setDubEngine(e.target.value)}
+            disabled={!dub || creating || picking !== null}
+            title="Which TTS engine synthesises the replacement voice."
+            className="rounded-md border bg-background px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
+          >
+            <option value="edge-tts">edge-tts (neural, en-GB Maisie)</option>
+            <option value="espeak-ng">espeak-ng (offline)</option>
+          </select>
           <button
             onClick={() => void createSession()}
             disabled={creating || !mediaPath.trim()}
@@ -459,11 +636,21 @@ export function PlayerPage() {
         </div>
         <p className="text-xs text-muted-foreground">
           “Choose video…” opens a file dialog on the machine running the Rust server and
-          immediately processes the file it returns. If a{' '}
-          <code className="font-mono">.srt</code>/<code className="font-mono">.vtt</code> sits
-          next to the media it is used; otherwise the audio is transcribed on the spot by the
-          built-in speech-to-text model (no internet needed). You can also type an absolute
-          path manually.
+          immediately processes the file it returns. It looks for{' '}
+          <code className="font-mono">&lt;name&gt;_full_sentence.srt</code> next to the video:
+          if that exists it is used as-is, otherwise the audio is transcribed by the built-in
+          speech-to-text model and saved to that file (no internet needed). You can also type
+          an absolute path manually. Tick <strong>Align timings</strong> to refine that
+          transcription's word timings with wav2vec2 forced alignment — it only applies when
+          the audio is transcribed (an existing <code className="font-mono">_full_sentence.srt</code>{' '}
+          is used as-is) and only in a server built with the <code className="font-mono">asr-align</code> feature.
+          Tick <strong>Dub audio</strong> to also synthesise a replacement voice track and play it
+          instead of the original audio (the video is muted). The engine is chosen beside the box:
+          <code className="font-mono">edge-tts</code> (the default) uses the English
+          (United Kingdom) <strong>Maisie</strong> neural voice and needs to be installed and
+          online; <code className="font-mono">espeak-ng</code> works offline. Dubbing keeps
+          each sentence at its original start time and only speeds a sentence up when it would
+          otherwise run into the next one.
         </p>
 
         {loading ? (
@@ -497,22 +684,51 @@ export function PlayerPage() {
       {session && (
         <div className="grid gap-6 lg:grid-cols-2">
           <div className="space-y-3">
-            <video
-              ref={mediaRef}
-              src={mediaSrc}
-              controls
-              preload="metadata"
-              onLoadedMetadata={applyPendingPosition}
-              onPause={() => {
-                const m = mediaRef.current;
-                if (m) saveProgress(activeRef.current, m.currentTime);
-              }}
-              onEnded={() => {
-                const m = mediaRef.current;
-                if (m) saveProgress(activeRef.current, m.currentTime);
-              }}
-              className="aspect-video w-full rounded-lg border bg-black"
-            />
+            {videoPlayable ? (
+              <video
+                ref={mediaRef}
+                src={mediaSrc}
+                controls
+                preload="metadata"
+                onLoadedMetadata={applyPendingPosition}
+                onPlay={() => syncDubbed(false)}
+                onPause={() => {
+                  dubbedRef.current?.pause();
+                  const m = mediaRef.current;
+                  if (m) saveProgress(activeRef.current, m.currentTime);
+                }}
+                onSeeked={() => syncDubbed(true)}
+                onRateChange={() => syncDubbed(false)}
+                onVolumeChange={() => syncDubbed(false)}
+                onEnded={() => {
+                  const m = mediaRef.current;
+                  if (m) saveProgress(activeRef.current, m.currentTime);
+                }}
+                className="aspect-video w-full rounded-lg border bg-black"
+              />
+            ) : (
+              <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-lg border bg-black px-6 text-center">
+                {videoFailed ? (
+                  <>
+                    <span className="text-sm text-destructive">
+                      This video could not be prepared for playback.
+                    </span>
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {session.video?.error}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-sm">Preparing video for playback…</span>
+                    <span className="text-xs text-muted-foreground">
+                      This browser cannot decode {(session.video?.codec ?? 'this').toUpperCase()},
+                      so the server is re-encoding it to H.264. That happens once per file —
+                      you can keep using the sentence list meanwhile.
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
             <div className="flex flex-wrap items-center gap-2">
               <button onClick={() => setLoopMode((v) => !v)} className={chipClass(loopMode)}>
                 Loop
@@ -530,9 +746,22 @@ export function PlayerPage() {
               )}
               <span className="ml-auto text-xs text-muted-foreground">
                 {basename(session.media_path)} · {session.media_duration.toFixed(1)}s ·{' '}
-                {cues.length} sentences
+                {cues.length} sentences{dubbed ? ' · 🔉 dubbed voice' : ''}
               </span>
             </div>
+            {dubbingRunning && (
+              <p className="text-xs text-muted-foreground">
+                Dubbing… {dubbing?.done ?? 0}/{dubbing?.total ?? cues.length} sentences
+                {dubbing?.stage === 'stitch' ? ' · assembling the voice track' : ''}
+              </p>
+            )}
+            {dubbing?.state === 'failed' && (
+              <p className="text-xs text-destructive">
+                {(dubbing.failed?.length ?? 0) > 0
+                  ? `${dubbing.failed.length} sentence(s) could not be dubbed and keep a silent slot — resume from the Manage page to retry just those.`
+                  : dubbing.error}
+              </p>
+            )}
             <div className="min-h-10 rounded-md border bg-muted/40 px-3 py-2 text-sm">
               {activeCue ? `▶ ${activeCue.text}` : 'Click a sentence below to play it.'}
             </div>
@@ -578,6 +807,102 @@ export function PlayerPage() {
                 </li>
               ))}
             </ol>
+          </div>
+        </div>
+      )}
+
+      {/* Floating button: manage the sessions stored in SQLite. */}
+      <button
+        onClick={() => setManageOpen(true)}
+        title="Manage stored sessions"
+        className="fixed right-6 bottom-6 z-40 flex items-center gap-2 rounded-full bg-primary px-4 py-3 text-sm font-medium text-primary-foreground shadow-lg transition-transform hover:scale-105 focus:ring-2 focus:ring-ring focus:outline-none"
+      >
+        🗂 Sessions
+        {sessions.length > 0 && (
+          <span className="rounded-full bg-primary-foreground/20 px-2 py-0.5 text-xs">
+            {sessions.length}
+          </span>
+        )}
+      </button>
+
+      {manageOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={() => setManageOpen(false)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div
+            className="flex max-h-[80vh] w-full max-w-2xl flex-col rounded-xl border bg-card shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4 border-b px-5 py-3">
+              <div>
+                <h2 className="text-lg font-semibold">Stored sessions</h2>
+                <p className="text-xs text-muted-foreground">
+                  Saved in the local SQLite database. Deleting removes the record, its cues
+                  and its resume point.
+                </p>
+              </div>
+              <button
+                onClick={() => setManageOpen(false)}
+                aria-label="Close"
+                className="rounded-md px-2 py-1 text-sm hover:bg-muted"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
+              {sessions.length === 0 ? (
+                <p className="py-8 text-center text-sm text-muted-foreground">
+                  No stored sessions.
+                </p>
+              ) : (
+                <ul className="space-y-2">
+                  {sessions.map((s) => (
+                    <li
+                      key={s.session_id}
+                      className="flex items-center gap-3 rounded-lg border p-3"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium">
+                          {basename(s.media_path)}
+                        </div>
+                        <div className="truncate font-mono text-[11px] text-muted-foreground">
+                          {s.media_path}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {s.cue_count} cues · {s.media_duration.toFixed(1)}s
+                          {s.last_index >= 0 ? ` · resume #${s.last_index + 1}` : ''}
+                          {session?.id === s.session_id ? ' · open' : ''}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => void deleteSession(s.session_id)}
+                        disabled={deleting !== null}
+                        className="shrink-0 rounded-md border border-destructive/40 px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                      >
+                        {deleting === s.session_id ? 'Deleting…' : 'Delete'}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between border-t px-5 py-3">
+              <span className="text-xs text-muted-foreground">
+                {sessions.length} record{sessions.length === 1 ? '' : 's'}
+              </span>
+              <button
+                onClick={() => void deleteAllSessions()}
+                disabled={deleting !== null || sessions.length === 0}
+                className="rounded-md border border-destructive/40 px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+              >
+                {deleting === '*' ? 'Deleting…' : 'Delete all'}
+              </button>
+            </div>
           </div>
         </div>
       )}

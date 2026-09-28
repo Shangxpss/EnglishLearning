@@ -51,10 +51,11 @@ interface CopilotKitProviderProps {
  * Wraps the app in a CopilotKit provider configured for the EnglishPro
  * assistant.
  *
- * - `runtimeUrl="/copilotkit"` is proxied to the agent-runtime (Bun) by
- *   vite.config.ts during development.
- * - `agent="english_pro_agent"` matches the agent name registered in
- *   agent-runtime/index.ts and backend/app/api/copilotkit.py.
+ * - `runtimeUrl="/copilotkit"` is proxied to the Rust agent service
+ *   (`sentence-video agent --port 4000`) by vite.config.ts during development.
+ * - `agent="sample_agent"` must match the id that service advertises from
+ *   `GET /copilotkit/info`. A mismatch is fatal, not cosmetic: the v2 client
+ *   throws `useAgent: Agent '…' not found after runtime sync`.
  * - `a2ui={{ catalog, includeSchema: true }}` enables rich UI rendering
  *   and injects the component schema into the LLM context.
  */
@@ -62,7 +63,7 @@ export function CopilotKitProvider({ children }: CopilotKitProviderProps) {
   return (
     <CopilotKit
       runtimeUrl="/copilotkit"
-      agent="english_pro_agent"
+      agent="sample_agent"
       useSingleEndpoint={false}
       a2ui={{ catalog: myCatalog, includeSchema: true }}
       renderToolCalls={cleanToolCallRenderers}

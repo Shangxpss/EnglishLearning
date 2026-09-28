@@ -149,6 +149,7 @@ mod tests {
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["activityType"], A2UI_ACTIVITY_TYPE);
         assert_eq!(value["content"]["tool"], "display_register_form");
-        assert_eq!(value["content"]["operations"], ops);
+        // The renderer keys off `a2ui_operations`; any other name renders nothing.
+        assert_eq!(value["content"][a2ui::A2UI_OPERATIONS_KEY], ops);
     }
 }

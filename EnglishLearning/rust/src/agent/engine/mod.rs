@@ -399,7 +399,11 @@ mod tests {
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["activityType"], crate::agent::protocol::A2UI_ACTIVITY_TYPE);
         assert_eq!(value["content"]["tool"], "display_register_form");
-        assert_eq!(value["content"]["operations"][0]["createSurface"]["surfaceId"], "register-form");
+        assert_eq!(
+            value["content"][crate::agent::protocol::a2ui::A2UI_OPERATIONS_KEY][0]["createSurface"]
+                ["surfaceId"],
+            "register-form"
+        );
     }
 
     #[test]

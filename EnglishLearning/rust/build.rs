@@ -22,6 +22,12 @@ fn main() {
         let abs = path.canonicalize().unwrap_or(path);
         let mb = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0) as f64 / 1_000_000.0;
         println!("cargo:rustc-env=ASR_MODEL_PATH={}", abs.display());
+        // The file name tells the runtime which DTW preset matches this model.
+        let name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        println!("cargo:rustc-env=ASR_MODEL_FILE={name}");
         println!("cargo:rustc-cfg=has_embedded_model");
         println!(
             "cargo:warning=embedding speech-to-text model {} ({mb:.1} MB)",

@@ -3,11 +3,13 @@
   "private": true,
   "version": "0.0.0",
   "scripts": {
-    "dev": "pnpm run dev:server & pnpm run dev:web & wait",
-    "dev:server": "bash rust/scripts/cargo-shim.sh watch --workdir rust -w src -x 'run -- --no-browser --port 8018'",
+    "dev": "pnpm run agent & pnpm run dev:server & pnpm run dev:web & wait",
+    "dev:server": "bash rust/scripts/cargo-shim.sh watch --workdir rust -w src -x 'run --features asr-align -- --no-browser --port 8018'",
+    "agent": "test -x rust/target/debug/sentence-video && rust/target/debug/sentence-video agent --port 4000 || bash rust/scripts/cargo-shim.sh run --manifest-path rust/Cargo.toml -- agent --port 4000",
+    "dev:agent": "bash rust/scripts/cargo-shim.sh run --manifest-path rust/Cargo.toml -- agent --port 4000",
     "dev:web": "pnpm --filter web dev",
     "build": "pnpm run build:server && pnpm run build:web",
-    "build:server": "bash rust/scripts/cargo-shim.sh build --release --manifest-path rust/Cargo.toml",
+    "build:server": "bash rust/scripts/cargo-shim.sh build --release --features asr-align --manifest-path rust/Cargo.toml",
     "build:web": "pnpm --filter web build"
   }
 }

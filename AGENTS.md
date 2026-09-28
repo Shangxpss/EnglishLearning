@@ -122,9 +122,57 @@ Build-machine prerequisites (NOT end-user requirements):
 Resulting artifact: **~86 MB** (was ~25 MB without the model). `cargo build
 --no-default-features` skips speech-to-text entirely for a fast, small, model-free build.
 
-Runtime flags: `--asr-model <path>`, `--asr-language <code>` (default `en`). Sessions built
-this way record `source_format = "asr"` and are cached like any other (a re-selected video
-reuses the stored cues instead of re-transcribing).
+Runtime flags: `--asr-model <path>`, `--asr-language <code>` (default `en`).
+
+### Word / cue timing accuracy
+
+Word timings come from whisper.cpp's **DTW** token timestamps (`dtw = 1` in the startup
+log), with the preset derived from the model file name (`ggml-base.en-*.bin` → `BaseEn`).
+DTW alone is still ~0.2 s late at phrase boundaries, so two audio-driven corrections run
+over the samples we already decoded (`asr::snap_word_starts_to_onsets`, 20 ms RMS envelope,
+adaptive thresholds; `SENTENCE_VIDEO_ASR_DEBUG=1` reports the counts):
+
+- **Starts** snap to the nearest sharp energy rise — a real onset. A breath ramps gently,
+  so it is not mistaken for speech.
+- **Ends** are trimmed to the **speech offset** when a pause follows, rather than being kept
+  flush with the next word's start. Ending exactly on the next onset put the boundary on the
+  first phoneme of the following sentence, so any playback overshoot voiced half that word.
+
+Measured on a 4-minute video, cue ends that immediately voice the next word dropped from
+**22/22 to 7/22**; the remaining 7 are boundaries with *no* pause, where the audio is
+genuinely continuous. The player polls the media clock every 20 ms so it stops inside the
+pause (a 60 ms timer allowed ~40 ms of overshoot).
+
+`build_cues` has **no duration or word cap** — cues split only at sentence-final
+punctuation, so they are always complete sentences (an earlier 12 s / 40-word cap sliced
+sentences mid-thought).
+
+### Which subtitle a session uses
+
+`build_session` resolves the cue source in this order (see
+`pipeline::transcribe::locate_subtitle`):
+
+1. an explicit `subtitle_path` from the API/CLI,
+2. **`<stem>_full_sentence.srt`** next to the media — e.g. `lecture.mp4` →
+   `lecture_full_sentence.srt`,
+3. otherwise **transcribe** — and the result is *saved as (2)*, so the next run reuses the
+   file.
+
+A legacy adjacent `<stem>.srt` / `<stem>.vtt` is deliberately **ignored**: the canonical
+file is the single source of truth, so a missing `_full_sentence.srt` always triggers
+transcription rather than silently adopting an unrelated subtitle. To use a hand-made
+subtitle, pass it explicitly as `subtitle_path` (API) or `--subtitle` (CLI).
+
+Consequences worth knowing:
+
+- The first run on a subtitle-free video pays the transcription cost and writes an
+  inspectable, editable `.srt` next to it; later runs just parse that file (no model load).
+- Editing the generated `.srt` is honoured: the SQLite cache key includes the subtitle's
+  mtime, so a changed file rebuilds the session.
+- The DB cache is checked *before* transcribing, so re-selecting an unchanged video is
+  instant. `POST /api/session?force=1` bypasses it.
+- Sessions record `source_format = "asr"` when transcribed and `"srt"`/`"vtt"` when parsed
+  from a file; the written file means a re-parse reports `"srt"`.
 
 ### Cargo registry note (temporary)
 

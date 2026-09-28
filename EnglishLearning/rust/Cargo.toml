@@ -23,6 +23,12 @@ path = "src/main.rs"
 # media player is needed (this also removes tokio/axum/reqwest).
 default = ["asr-whisper", "agent"]
 asr-whisper = ["dep:whisper-rs"]
+# wav2vec2 CTC forced alignment (`sentence-video align`). OFF by default, and
+# deliberately empty: the model is hand-written in `src/align/`, so enabling it
+# adds no dependencies — the single-executable promise is untouched. It does
+# however need ~378 MB of weights on disk at runtime (they are far too large to
+# embed), so it is not part of the default build.
+asr-align = []
 agent = [
     "dep:ag-ui",
     "dep:axum",
@@ -71,8 +77,19 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 ] }
 futures-util = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
-
 [profile.release]
 opt-level = 3
 lto = true
 strip = true
+
+# The wav2vec2 forced-alignment forward pass is hand-written in this crate
+# (`align/`, enabled by `--features asr-align`) and is the dominant cost of
+# building a session: on a 60 s clip, two 30 s windows took ~3 min with
+# `--release` and were still running after 18 min in the debug profile. The dev
+# server runs the debug profile, so alignment was effectively unusable there.
+#
+# Scoped to this package on purpose: no dependency (FFmpeg, whisper.cpp, SQLite)
+# changes profile, so nothing else is recompiled and — because the aligner is
+# pure Rust with no dependencies — the entire hot path is still optimized.
+[profile.dev.package.sentence-video]
+opt-level = 3

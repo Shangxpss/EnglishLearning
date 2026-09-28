@@ -37,6 +37,44 @@ pub fn pick_file(kind: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// Show `path` in the OS file manager.
+///
+/// The server runs on the same machine as the browser in the default loopback
+/// setup, so a folder it opens is the one the user is looking at. The spawned
+/// program is detached: its exit code says nothing useful (Windows `explorer`
+/// reports failure even on success), so only the spawn is checked.
+pub fn open_dir(path: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to launch explorer: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to launch open: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to launch xdg-open: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = path;
+        Err("opening a directory is not supported on this platform".to_string())
+    }
+}
+
 fn dialog_title(kind: &str) -> &'static str {
     if kind == "subtitle" {
         "Select a subtitle file (.srt / .vtt)"

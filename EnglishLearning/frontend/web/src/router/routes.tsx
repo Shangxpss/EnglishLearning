@@ -9,6 +9,7 @@ import { ProgressPage } from '@/features/progress';
 import { ReadingPage } from '@/features/reading';
 import { AssistantPage } from '@/features/assistant';
 import { PlayerPage } from '@/features/player';
+import { ManagePage } from '@/features/manage';
 import { LoginPage } from '@/features/auth/login';
 import { SignupPage } from '@/features/auth/signup';
 
@@ -23,6 +24,9 @@ export const routes: RouteObject[] = [
       // /player uses /api/sessions, /api/session, /cues, /media, /audio —
       // all implemented in rust/src/app.rs.
       { path: 'player', element: <PlayerPage /> },
+      // /manage is CRUD over the processed videos plus their processing state;
+      // /player is for watching. `?session=<id>` opens one specific session.
+      { path: 'manage', element: <ManagePage /> },
 
       // ── Legacy Python/FastAPI routes (hidden from the nav) ───────────────
       // These call endpoints the Rust binary does not implement. They stay

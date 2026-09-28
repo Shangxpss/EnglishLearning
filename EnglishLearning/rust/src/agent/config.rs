@@ -9,6 +9,8 @@
 //! model are all configurable here.
 
 use std::env;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Default agent id — must match `CopilotKit agent="…"` in the frontend.
 pub const DEFAULT_AGENT_ID: &str = "sample_agent";
@@ -68,6 +70,9 @@ impl Default for AgentConfig {
 impl AgentConfig {
     /// Build a configuration from the environment, falling back to defaults.
     ///
+    /// `.env` is read first (see [`load_dotenv`]), so `DEEPSEEK_API_KEY` can live
+    /// in a gitignored file instead of the shell or the command line.
+    ///
     /// | variable | field |
     /// | --- | --- |
     /// | `AGENT_HOST` | [`Self::host`] |
@@ -79,6 +84,7 @@ impl AgentConfig {
     /// | `DEEPSEEK_BASE_URL` | [`Self::base_url`] |
     /// | `DEEPSEEK_API_KEY` | [`Self::api_key`] |
     pub fn from_env() -> Self {
+        load_dotenv();
         let mut cfg = AgentConfig::default();
         if let Some(v) = env_string("AGENT_HOST") {
             cfg.host = v;
@@ -128,6 +134,140 @@ fn env_string(key: &str) -> Option<String> {
     env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// .env loading
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The `.env` a run reads, resolved once.
+///
+/// `None` means "nothing found", including "searched and missed" — the answer is
+/// cached either way, so only the first caller can log the miss.
+static DOTENV_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Load `.env` into the process environment, without overriding anything already
+/// set there.
+///
+/// An exported `DEEPSEEK_API_KEY=… ./sentence-video agent` must win over the file:
+/// that precedence is what makes a stale `.env` harmless when you are testing a
+/// different key. The file lives in the working directory or in any ancestor of
+/// it, so `pnpm run dev:agent` (which runs from the workspace root) picks up the
+/// one next to `package.json`.
+///
+/// Variables already present in the environment are skipped, which also means a
+/// repeated call is harmless.
+///
+/// Set `DOTENV_PATH` to read a specific file instead of searching; that is also
+/// the hook the tests use.
+pub fn load_dotenv() {
+    if let Some(path) = dotenv_path() {
+        load_dotenv_from(path);
+    }
+}
+
+/// The `.env` to read, for diagnostics and tests.
+pub fn dotenv_path() -> Option<&'static Path> {
+    DOTENV_PATH
+        .get_or_init(|| {
+            if let Some(explicit) = env_string("DOTENV_PATH") {
+                let path = PathBuf::from(explicit);
+                if !path.is_file() {
+                    eprintln!(
+                        "sentence-video agent: DOTENV_PATH={} is not a file — ignoring it",
+                        path.display()
+                    );
+                    return None;
+                }
+                return Some(path);
+            }
+
+            let cwd = env::current_dir().ok()?;
+            let mut dir: Option<&Path> = Some(cwd.as_path());
+            while let Some(current) = dir {
+                let candidate = current.join(".env");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                dir = current.parent();
+            }
+
+            eprintln!(
+                "sentence-video agent: no .env found from {} upward — \
+                 DEEPSEEK_API_KEY must be exported",
+                cwd.display()
+            );
+            None
+        })
+        .as_deref()
+}
+
+/// Apply one dotenv file.
+fn load_dotenv_from(path: &Path) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("sentence-video agent: cannot read {}: {e}", path.display());
+            return;
+        }
+    };
+
+    let mut loaded = 0usize;
+    for line in text.lines() {
+        let Some((key, value)) = parse_dotenv_line(line) else { continue };
+        // An already-exported variable wins over the file, so testing a one-off
+        // key needs no edit to `.env`.
+        if env::var_os(&key).is_some() {
+            continue;
+        }
+        // `set_var` is unsafe as of edition 2024 because it races with other
+        // threads reading the environment. This runs once, before the runtime is
+        // built, so there is nothing to race with.
+        unsafe {
+            env::set_var(&key, &value);
+        }
+        loaded += 1;
+    }
+    eprintln!("sentence-video agent: loaded {loaded} variable(s) from {}", path.display());
+}
+
+/// Parse one dotenv line into a key/value pair.
+///
+/// Understands the shape a `.env` is actually written in: blank lines, `#`
+/// comments, an optional `export ` prefix, `KEY=value`, single or double quotes,
+/// and a trailing `# comment` on an unquoted value. Returns `None` for anything
+/// that is not a pair, so a malformed file degrades instead of failing startup.
+fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    let value = value.trim();
+    let value = if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        // Quoted: the quotes are literal boundaries, so a `#` inside stays.
+        value[1..value.len() - 1].to_string()
+    } else {
+        // Unquoted: an unescaped `#` starts a trailing comment.
+        let cut = value.find(" #").or_else(|| value.strip_prefix('#').map(|_| 0));
+        match cut {
+            Some(0) => String::new(),
+            Some(at) => value[..at].trim_end().to_string(),
+            None => value.to_string(),
+        }
+    };
+
+    Some((key.to_string(), value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +277,45 @@ mod tests {
         let mut cfg = AgentConfig::default();
         cfg.base_url = "https://api.deepseek.com/".to_string();
         assert_eq!(cfg.chat_completions_url(), "https://api.deepseek.com/chat/completions");
+    }
+
+    #[test]
+    fn parses_the_dotenv_shapes_a_real_file_uses() {
+        assert_eq!(
+            parse_dotenv_line("DEEPSEEK_API_KEY=sk-abc"),
+            Some(("DEEPSEEK_API_KEY".into(), "sk-abc".into()))
+        );
+        assert_eq!(
+            parse_dotenv_line("export AGENT_MODEL=\"deepseek-chat\""),
+            Some(("AGENT_MODEL".into(), "deepseek-chat".into()))
+        );
+        assert_eq!(
+            parse_dotenv_line("AGENT_HOST='127.0.0.1'"),
+            Some(("AGENT_HOST".into(), "127.0.0.1".into()))
+        );
+        assert_eq!(
+            parse_dotenv_line("AGENT_PORT=4000 # the agent port"),
+            Some(("AGENT_PORT".into(), "4000".into()))
+        );
+        assert_eq!(parse_dotenv_line("EMPTY="), Some(("EMPTY".into(), String::new())));
+    }
+
+    #[test]
+    fn ignores_comments_blanks_and_junk() {
+        assert_eq!(parse_dotenv_line("# a comment"), None);
+        assert_eq!(parse_dotenv_line("   "), None);
+        assert_eq!(parse_dotenv_line("not a pair"), None);
+        assert_eq!(parse_dotenv_line("=novalue"), None);
+    }
+
+    #[test]
+    fn a_quoted_value_keeps_a_hash() {
+        assert_eq!(
+            parse_dotenv_line("SECRET=\"abc#def\""),
+            Some(("SECRET".into(), "abc#def".into()))
+        );
+        // Unquoted, the `#` opens a comment only when preceded by whitespace.
+        assert_eq!(parse_dotenv_line("SECRET=abc#def"), Some(("SECRET".into(), "abc#def".into())));
     }
 
     #[test]

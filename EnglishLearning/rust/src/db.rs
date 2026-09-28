@@ -20,7 +20,7 @@ pub struct SourceKey {
     pub subtitle_mtime: Option<i64>,
 }
 
-/// Row shape returned by [`Db::list_sessions`].
+/// Row shape returned by [`Store::list_sessions`].
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSummary {
     pub session_id: String,
@@ -45,6 +45,28 @@ pub struct Progress {
 
 fn default_index() -> i64 {
     -1
+}
+
+/// Persistence port used by the app.
+///
+/// [`crate::app::AppState`] depends on this trait, never on a concrete backend,
+/// so the storage engine is chosen once at startup and can be swapped (another
+/// database, or an in-memory fake in tests) without touching request handling.
+/// [`Db`] is the SQLite implementation.
+pub trait Store: Send + Sync {
+    /// The most recent stored session for this exact source, if any.
+    fn find_by_source(&self, key: &SourceKey) -> Option<Session>;
+    fn get_session(&self, id: &str) -> Option<Session>;
+    /// Persist a freshly built session (idempotent for an existing id).
+    fn insert_session(&self, session: &Session, key: &SourceKey) -> Result<(), String>;
+    /// All stored sessions, most recently used first.
+    fn list_sessions(&self) -> Vec<SessionSummary>;
+    fn get_progress(&self, session_id: &str) -> Option<Progress>;
+    fn set_progress(&self, session_id: &str, p: Progress) -> Result<(), String>;
+    /// Delete one stored session; returns whether a row was actually removed.
+    fn delete_session(&self, session_id: &str) -> Result<bool, String>;
+    /// Delete every stored session. Returns how many were removed.
+    fn delete_all_sessions(&self) -> Result<usize, String>;
 }
 
 pub struct Db {
@@ -107,9 +129,10 @@ impl Db {
             conn: Mutex::new(conn),
         })
     }
+}
 
-    /// The most recent stored session for this exact source, if any.
-    pub fn find_by_source(&self, key: &SourceKey) -> Option<Session> {
+impl Store for Db {
+    fn find_by_source(&self, key: &SourceKey) -> Option<Session> {
         let id: Option<String> = {
             let conn = self.conn.lock().ok()?;
             conn.query_row(
@@ -131,7 +154,7 @@ impl Db {
         self.get_session(&id?)
     }
 
-    pub fn get_session(&self, id: &str) -> Option<Session> {
+    fn get_session(&self, id: &str) -> Option<Session> {
         let conn = self.conn.lock().ok()?;
         let (id, media_path, media_duration, source_format) = conn
             .query_row(
@@ -159,7 +182,7 @@ impl Db {
     }
 
     /// Persist a freshly built session (idempotent for an existing id).
-    pub fn insert_session(&self, session: &Session, key: &SourceKey) -> Result<(), String> {
+    fn insert_session(&self, session: &Session, key: &SourceKey) -> Result<(), String> {
         let mut conn = self
             .conn
             .lock()
@@ -219,7 +242,7 @@ impl Db {
     }
 
     /// All stored sessions, most recently used first.
-    pub fn list_sessions(&self) -> Vec<SessionSummary> {
+    fn list_sessions(&self) -> Vec<SessionSummary> {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
@@ -248,7 +271,7 @@ impl Db {
         rows.filter_map(Result::ok).collect()
     }
 
-    pub fn get_progress(&self, session_id: &str) -> Option<Progress> {
+    fn get_progress(&self, session_id: &str) -> Option<Progress> {
         let conn = self.conn.lock().ok()?;
         conn.query_row(
             "SELECT last_index, position FROM progress WHERE session_id = ?1",
@@ -264,7 +287,7 @@ impl Db {
         .ok()?
     }
 
-    pub fn set_progress(&self, session_id: &str, p: Progress) -> Result<(), String> {
+    fn set_progress(&self, session_id: &str, p: Progress) -> Result<(), String> {
         let conn = self
             .conn
             .lock()
@@ -287,6 +310,30 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Delete one stored session. Its cues and progress rows go with it via
+    /// `ON DELETE CASCADE` (foreign keys are enabled in [`Db::open`]).
+    /// Returns whether a row was actually removed.
+    fn delete_session(&self, session_id: &str) -> Result<bool, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let removed = conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+            .map_err(|e| e.to_string())?;
+        Ok(removed > 0)
+    }
+
+    /// Delete every stored session. Returns how many were removed.
+    fn delete_all_sessions(&self) -> Result<usize, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        conn.execute("DELETE FROM sessions", [])
+            .map_err(|e| e.to_string())
     }
 }
 

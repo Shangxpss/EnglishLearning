@@ -121,7 +121,7 @@ export function AppShell() {
           still works if that runtime is started. To restore the sidebar,
           uncomment it and its import above.
       <CopilotSidebar
-        agentId="english_pro_agent"
+        agentId="sample_agent"
         defaultOpen={false}
         labels={{
           modalHeaderTitle: 'EnglishPro Assistant',
