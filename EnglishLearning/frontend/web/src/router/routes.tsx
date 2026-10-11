@@ -10,6 +10,7 @@ import { ReadingPage } from '@/features/reading';
 import { AssistantPage } from '@/features/assistant';
 import { PlayerPage } from '@/features/player';
 import { ManagePage } from '@/features/manage';
+import { LogsPage } from '@/features/logs';
 import { LoginPage } from '@/features/auth/login';
 import { SignupPage } from '@/features/auth/signup';
 
@@ -27,6 +28,9 @@ export const routes: RouteObject[] = [
       // /manage is CRUD over the processed videos plus their processing state;
       // /player is for watching. `?session=<id>` opens one specific session.
       { path: 'manage', element: <ManagePage /> },
+      // /logs reads the server's logs.db — requests + background jobs — so a
+      // problem noticed after the fact can still be traced.
+      { path: 'logs', element: <LogsPage /> },
 
       // ── Legacy Python/FastAPI routes (hidden from the nav) ───────────────
       // These call endpoints the Rust binary does not implement. They stay

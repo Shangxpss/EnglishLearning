@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use crate::logs;
 use crate::media;
 use crate::models::{Cue, Word};
 use crate::pipeline::checkpoint;
@@ -46,9 +47,14 @@ fn make_cue(index: usize, words: &[Word]) -> Cue {
 /// `cue_builder.build_aligned_cues`.
 ///
 /// Words accumulate until a **sentence-final punctuation mark**, so a cue is
-/// always a complete sentence however long it runs. There is deliberately no
-/// duration or word-count cap: those split sentences mid-thought (e.g. a 12 s
-/// limit cutting "...powering today's" from "most dynamic data architectures").
+/// normally a complete sentence. Whisper punctuates a long monologue with commas
+/// alone, though, so a "sentence" can run for minutes; [`segmenter::finalize`]
+/// then cuts anything past [`segmenter::MAX_CUE_SECS`] at the nearest natural
+/// boundary, because such a cue can neither be synthesised as one clip nor read
+/// at a glance. There is deliberately no word-count cap and no aggressive
+/// duration cap: a normal sentence is never split, and the older 12 s / 40-word
+/// cap that sliced sentences mid-thought (ending a cue on "...powering today's"
+/// instead of at the next full stop) stays gone.
 /// Any trailing words at the end of the audio form a final cue.
 ///
 /// Output is sample-clamped via [`segmenter::finalize`].
@@ -199,9 +205,16 @@ pub fn transcribe_words_with(
                 "sentence-video: reusing {} transcribed word(s) from the checkpoint",
                 words.len()
             );
+            logs::debug("asr", "reusing transcribed words from the checkpoint")
+                .media(media_path)
+                .detail(format!("{} word(s)", words.len()))
+                .send();
             // Only the aligner needs the audio, and decoding it is not free.
             let samples = if align {
                 report(progress, BuildStage::Decode)?;
+                logs::debug("asr", "decoding audio for alignment")
+                    .media(media_path)
+                    .send();
                 media::decode_to_f32(media_path, crate::asr::SAMPLE_RATE, true, None)?.0
             } else {
                 Vec::new()
@@ -210,18 +223,44 @@ pub fn transcribe_words_with(
         }
         None => {
             if !crate::asr::model_available(model) {
+                logs::error("asr", "speech-to-text model unavailable")
+                    .media(media_path)
+                    .send();
                 return Err(crate::asr::NO_MODEL_HELP.to_string());
             }
             report(progress, BuildStage::Decode)?;
+            logs::debug("asr", "decoding audio")
+                .media(media_path)
+                .send();
             let (samples, _channels) =
                 media::decode_to_f32(media_path, crate::asr::SAMPLE_RATE, true, None)?;
             if samples.is_empty() {
+                logs::error("asr", "no audio track could be decoded")
+                    .media(media_path)
+                    .send();
                 return Err(format!(
                     "no audio track could be decoded from '{media_path}'"
                 ));
             }
             report(progress, BuildStage::Transcribe)?;
+            logs::info("asr", "transcribing audio")
+                .media(media_path)
+                .detail(format!(
+                    "model={} · language={} · {:.1}s of audio",
+                    model
+                        .map(|m| m.display().to_string())
+                        .unwrap_or_else(|| "<embedded>".into()),
+                    language.unwrap_or("en"),
+                    duration_secs
+                ))
+                .send();
+            let started = std::time::Instant::now();
             let words = crate::asr::transcribe(&samples, model, language)?;
+            logs::info("asr", "transcription finished")
+                .media(media_path)
+                .detail(format!("{} word(s)", words.len()))
+                .duration_ms(started.elapsed().as_millis() as i64)
+                .send();
             if let Some(dir) = checkpoint {
                 // Written straight after ASR so an interruption during
                 // alignment does not cost the transcription again.
@@ -261,18 +300,39 @@ fn refine_timings(
     }
     let Some(path) = align::default_weights_path() else {
         eprintln!("sentence-video: {}", align::NO_WEIGHTS_HELP);
+        logs::warn(
+            "align",
+            "alignment weights missing; keeping whisper timings",
+        )
+        .send();
         return Ok(words);
     };
+    let windows = align::plan_windows(&words).len();
     println!(
         "sentence-video: refining word timings with {} ({} words, {} windows)",
         path.display(),
         words.len(),
-        align::plan_windows(&words).len()
+        windows
     );
+    logs::info("align", "refining word timings with wav2vec2")
+        .detail(format!(
+            "weights={} · {} word(s) · {} window(s)",
+            path.display(),
+            words.len(),
+            windows
+        ))
+        .send();
+    let started = std::time::Instant::now();
     let aligner = match align::Aligner::load(&path) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("sentence-video: cannot load alignment weights: {e}");
+            logs::error(
+                "align",
+                "cannot load alignment weights; keeping whisper timings",
+            )
+            .detail(&e)
+            .send();
             return Ok(words);
         }
     };
@@ -284,6 +344,13 @@ fn refine_timings(
         "sentence-video: alignment finished: {} of {} window(s) aligned, {} kept whisper timings",
         stats.aligned, stats.windows, stats.failed
     );
+    logs::info("align", "alignment finished")
+        .detail(format!(
+            "{} of {} window(s) aligned · {} kept whisper timings",
+            stats.aligned, stats.windows, stats.failed
+        ))
+        .duration_ms(started.elapsed().as_millis() as i64)
+        .send();
     Ok(refined)
 }
 
@@ -400,10 +467,20 @@ pub fn transcribe_and_save(
     let cues = build_cues(&transcript.words, transcript.duration_secs, media_path);
     let out = sentence_subtitle_path(media_path);
     match subtitle::write_srt(&cues, &out) {
-        Ok(()) => Ok((cues, Some(out))),
+        Ok(()) => {
+            logs::info("asr", "transcript saved")
+                .media(media_path)
+                .detail(format!("{} cue(s) → {out}", cues.len()))
+                .send();
+            Ok((cues, Some(out)))
+        }
         Err(e) => {
             // A read-only folder must not fail the session.
             eprintln!("sentence-video: could not save the transcript: {e}");
+            logs::warn("asr", "could not save the transcript")
+                .media(media_path)
+                .detail(&e)
+                .send();
             Ok((cues, None))
         }
     }
@@ -494,27 +571,76 @@ mod tests {
         assert_eq!(cues[0].text, "See (e.g. one).");
     }
 
-    /// Regression: a long sentence must stay **one** cue. A former 12-second /
-    /// 40-word cap sliced sentences mid-thought (e.g. ending a cue on
-    /// "...powering today's" instead of at the next full stop).
+    /// Regression: a normal sentence must stay **one** cue. This 12 s / 40-word
+    /// run is well under [`segmenter::MAX_CUE_SECS`], whereas the former 12 s /
+    /// 40-word cap sliced exactly this kind of sentence mid-thought.
     #[test]
-    fn long_sentence_is_not_split_by_a_length_cap() {
-        let mut words: Vec<Word> = (0..60)
+    fn a_normal_long_sentence_is_not_split() {
+        let mut words: Vec<Word> = (0..40)
             .map(|i| Word {
                 text: format!("word{i}"),
-                start: i as f64 * 0.7,
-                end: i as f64 * 0.7 + 0.6,
+                start: i as f64 * 0.3,
+                end: i as f64 * 0.3 + 0.25,
                 score: 1.0,
             })
             .collect();
         words.last_mut().unwrap().text = "end.".to_string();
 
         let span = words.last().unwrap().end - words[0].start;
-        assert!(span > 12.0, "test needs a >12s run, got {span}s");
-        assert!(words.len() > 40, "test needs >40 words");
+        assert!(
+            (11.0..segmenter::MAX_CUE_SECS).contains(&span),
+            "test needs a ~12s run, got {span}s"
+        );
+        assert!(words.len() >= 40, "test needs a 40-word run");
 
         let cues = build_cues(&words, 120.0, "/media/sample.mp4");
-        assert_eq!(cues.len(), 1, "a complete sentence must not be split");
+        assert_eq!(cues.len(), 1, "a sentence under the cap must not be split");
         assert!(cues[0].text.ends_with("end."));
+    }
+
+    /// A runaway "sentence" — whisper punctuated a monologue with a single comma
+    /// — is cut at natural boundaries so every cue is short enough to synthesise
+    /// and read. No word is dropped and the pieces join seamlessly.
+    #[test]
+    fn a_runaway_sentence_is_split_at_a_natural_boundary() {
+        // 100 words at 0.5 s apart = ~50 s, punctuated only by one comma.
+        let mut words: Vec<Word> = (0..100)
+            .map(|i| Word {
+                text: format!("word{i}"),
+                start: i as f64 * 0.5,
+                end: i as f64 * 0.5 + 0.4,
+                score: 1.0,
+            })
+            .collect();
+        words[50].text = "however,".to_string();
+        words.last_mut().unwrap().text = "end.".to_string();
+
+        let span = words.last().unwrap().end - words[0].start;
+        assert!(
+            span > segmenter::MAX_CUE_SECS,
+            "test needs a >20s run, got {span}s"
+        );
+
+        let cues = build_cues(&words, 120.0, "/media/sample.mp4");
+        assert!(cues.len() > 1, "a runaway sentence must be split");
+
+        let original = words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let joined = cues
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, original, "no word may be lost");
+
+        for c in &cues {
+            assert!(c.end - c.start <= segmenter::MAX_CUE_SECS + 1e-9, "{c:?}");
+        }
+        for pair in cues.windows(2) {
+            assert!((pair[1].start - pair[0].end).abs() < 1e-9, "{pair:?}");
+        }
     }
 }

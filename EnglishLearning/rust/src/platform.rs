@@ -8,79 +8,19 @@
 //! writes them as `<video stem>.srt` beside the source video, deliberately
 //! separate from the `_full_sentence` file.
 //!
+//! The boundary machinery lives in [`crate::segmenter`], which also uses it to
+//! cap a sentence cue's length; this module supplies the character budget.
+//!
 //! Timings come from the voice the export is meant to accompany. A dubbed
 //! track replaces every sentence with a freshly synthesised one, so the
 //! original word timings no longer describe it; [`retime_to_dubbed`] measures
 //! the sentences against the dubbed audio instead.
 
 use crate::models::{Cue, Word};
+use crate::segmenter::{self, into_words, spread};
 
 /// Per-cue character budget: YouTube's single-line limit.
 pub const DEFAULT_MAX_CHARS: usize = 42;
-
-/// A split never makes a chunk shorter than this while a longer one is
-/// available, so a sentence does not break into a two-word orphan.
-const MIN_CHUNK_CHARS: usize = 14;
-
-/// Words that may not be left at the end of a line: on its own "the" or "will"
-/// reads as a mistake, so the break moves earlier instead.
-const DANGLING: &[&str] = &[
-    "a", "an", "the", "this", "that", "these", "those", "my", "your", "his", "her", "its", "our",
-    "their", "some", "any", "no", "every", "each", "both", "all", "such", "am", "is", "are", "was",
-    "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would",
-    "shall", "should", "can", "could", "may", "might", "must",
-];
-
-/// Coordinating conjunctions: a break lands *before* one, so the new cue opens
-/// with it and both halves read as clauses.
-const COORDINATORS: &[&str] = &["and", "but", "or", "nor", "so", "yet", "for"];
-
-/// Subordinating conjunctions and relative pronouns — the "pronoun" half of
-/// "split at a conjunction or a pronoun".
-const SUBORDINATORS: &[&str] = &[
-    "because", "although", "though", "while", "when", "whenever", "whereas", "since", "if",
-    "unless", "until", "till", "after", "before", "as", "which", "who", "whom", "whose", "where",
-    "why", "how", "than", "whether", "once", "that",
-];
-
-const PREPOSITIONS: &[&str] = &[
-    "to",
-    "of",
-    "in",
-    "on",
-    "at",
-    "with",
-    "by",
-    "from",
-    "about",
-    "into",
-    "over",
-    "under",
-    "between",
-    "during",
-    "without",
-    "within",
-    "through",
-    "against",
-    "among",
-    "across",
-    "upon",
-    "toward",
-    "towards",
-    "behind",
-    "beyond",
-    "beneath",
-    "beside",
-    "despite",
-    "except",
-    "inside",
-    "outside",
-    "onto",
-    "throughout",
-    "underneath",
-    "unlike",
-    "via",
-];
 
 /// Where the platform subtitle for `media_path` goes: the video's own name in
 /// the video's own folder, e.g. `/videos/lecture.mp4` → `/videos/lecture.srt`.
@@ -99,38 +39,16 @@ pub fn export(cues: &[Cue], media_path: &str, max_chars: usize) -> Result<String
     Ok(path)
 }
 
-/// One word of a cue with the timing a break can be placed against.
-struct Tok {
-    text: String,
-    start: f64,
-    end: f64,
-}
-
 /// A sentence cue cut into platform-sized cues.
 ///
-/// Each cut goes at the best boundary inside the text that still fits (see
-/// [`best_gap`]); a cue that already fits is passed through untouched.
+/// Each cut goes at the best boundary inside the text that still fits; a cue
+/// that already fits is passed through untouched. See
+/// [`segmenter::split_by`] for the splitting itself.
 pub fn split_cues(cues: &[Cue], max_chars: usize) -> Vec<Cue> {
     let max_chars = max_chars.max(8);
-    let mut out = Vec::new();
-    for cue in cues {
-        let toks = tokens(cue);
-        if toks.is_empty() {
-            continue;
-        }
-        let mut start = 0usize;
-        loop {
-            let end = furthest_fit(&toks, start, max_chars);
-            if end >= toks.len() {
-                out.push(chunk(cue, &toks, start, toks.len(), out.len()));
-                break;
-            }
-            let split = best_gap(&toks, start, end);
-            out.push(chunk(cue, &toks, start, split, out.len()));
-            start = split;
-        }
-    }
-    out
+    segmenter::split_by(cues, |toks, start, end| {
+        segmenter::chars(&toks[start..end]) <= max_chars
+    })
 }
 
 /// Re-measure the session's sentences against the dubbed track.
@@ -203,196 +121,10 @@ pub fn retime_to_dubbed(cues: &[Cue], dubbed: &[Word]) -> Vec<Cue> {
     out
 }
 
-/// The words of `cue`, timed. Word timings are used when they are real;
-/// otherwise (a cue parsed from a hand-written subtitle carries zeros) the
-/// words are spread across the cue in proportion to their length.
-fn tokens(cue: &Cue) -> Vec<Tok> {
-    let texts: Vec<String> = if cue.words.is_empty() {
-        cue.text.split_whitespace().map(|w| w.to_string()).collect()
-    } else {
-        cue.words.iter().map(|w| w.text.clone()).collect()
-    };
-    if texts.is_empty() {
-        return Vec::new();
-    }
-    let timed = cue.words.len() == texts.len() && cue.words.iter().any(|w| w.end > w.start);
-    if timed {
-        cue.words
-            .iter()
-            .map(|w| Tok {
-                text: w.text.clone(),
-                start: w.start,
-                end: w.end,
-            })
-            .collect()
-    } else {
-        spread(&texts, cue.start, cue.end)
-    }
-}
-
-/// Lay `texts` end to end across `[start, end]`, each word getting a share of
-/// the time proportional to its length.
-fn spread(texts: &[String], start: f64, end: f64) -> Vec<Tok> {
-    let total: usize = texts.iter().map(|t| t.chars().count().max(1)).sum();
-    let span = (end - start).max(0.0);
-    let mut done = 0usize;
-    let mut out = Vec::with_capacity(texts.len());
-    for text in texts {
-        let at = |chars: usize| start + span * (chars as f64 / total as f64);
-        let begin = at(done);
-        done += text.chars().count().max(1);
-        out.push(Tok {
-            text: text.clone(),
-            start: begin,
-            end: at(done),
-        });
-    }
-    out
-}
-
-/// `spread`'s tokens as the words a cue carries.
-fn into_words(toks: Vec<Tok>) -> Vec<Word> {
-    toks.into_iter()
-        .map(|t| Word {
-            text: t.text,
-            start: t.start,
-            end: t.end,
-            score: 1.0,
-        })
-        .collect()
-}
-
-/// The last index (exclusive) that still fits in `max_chars`, counting the
-/// single space between words. Always advances, so a word longer than the
-/// whole budget is a cue of its own rather than an infinite loop.
-fn furthest_fit(toks: &[Tok], start: usize, max_chars: usize) -> usize {
-    let mut len = 0usize;
-    let mut end = start;
-    while end < toks.len() {
-        let add = toks[end].text.chars().count() + usize::from(end > start);
-        if end > start && len + add > max_chars {
-            break;
-        }
-        len += add;
-        end += 1;
-    }
-    end
-}
-
-/// Where to cut a cue that must break at or before `end`.
-///
-/// The strongest boundary inside the window wins — clause punctuation, then a
-/// comma, then a conjunction, then a subordinate clause or relative pronoun,
-/// then a preposition — and ties go to the latest one, so the line is used
-/// rather than wasted. A boundary that would leave a phrase hanging is never
-/// taken; with no boundary at all the cue breaks at `end`, the furthest word
-/// that still fits.
-fn best_gap(toks: &[Tok], start: usize, end: usize) -> usize {
-    let mut natural: Option<(u8, usize)> = None;
-    let mut fallback: Option<usize> = None;
-    for k in (start + 1)..=end {
-        if boundary(toks, k).is_none() {
-            continue;
-        }
-        if chars(&toks[start..k]) < MIN_CHUNK_CHARS {
-            continue;
-        }
-        fallback = Some(k);
-        if chars(&toks[k..]) < MIN_CHUNK_CHARS {
-            continue;
-        }
-        let score = score(toks, k);
-        if score == 0 {
-            continue;
-        }
-        if natural.map_or(true, |(best, _)| score >= best) {
-            natural = Some((score, k));
-        }
-    }
-    natural.map(|(_, k)| k).or(fallback).unwrap_or(end)
-}
-
-/// Whether a line may end between `toks[k - 1]` and `toks[k]`.
-fn boundary(toks: &[Tok], k: usize) -> Option<()> {
-    let next = stem(&toks[k].text);
-    if toks[k].text.starts_with('\'') || next == "not" || next == "n't" {
-        return None;
-    }
-    let prev = stem(&toks[k - 1].text);
-    if DANGLING.contains(&prev.as_str()) || PREPOSITIONS.contains(&prev.as_str()) {
-        return None;
-    }
-    Some(())
-}
-
-/// How natural a break after `toks[k - 1]` is; `0` is a plain word boundary.
-fn score(toks: &[Tok], k: usize) -> u8 {
-    let prev = toks[k - 1].text.trim_end();
-    if [':', ';', '—', '–'].iter().any(|c| prev.ends_with(*c)) {
-        return 5;
-    }
-    if prev.ends_with(',') {
-        return 4;
-    }
-    let next = stem(&toks[k].text);
-    if COORDINATORS.contains(&next.as_str()) {
-        return 3;
-    }
-    if SUBORDINATORS.contains(&next.as_str()) {
-        return 2;
-    }
-    if PREPOSITIONS.contains(&next.as_str()) {
-        return 1;
-    }
-    0
-}
-
-/// A word stripped of surrounding punctuation and lower-cased, so `"And"` and
-/// `"and"` are the same conjunction.
-fn stem(word: &str) -> String {
-    word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
-        .to_lowercase()
-}
-
-fn chars(toks: &[Tok]) -> usize {
-    toks.iter().map(|t| t.text.chars().count()).sum::<usize>() + toks.len().saturating_sub(1)
-}
-
-/// Build the cue for `toks[a..b]`. Its end is the next chunk's start, so the
-/// pieces of one sentence join seamlessly; the last piece ends where the
-/// sentence did.
-fn chunk(cue: &Cue, toks: &[Tok], a: usize, b: usize, index: usize) -> Cue {
-    let text = toks[a..b]
-        .iter()
-        .map(|t| t.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let start = toks[a].start;
-    let end = match toks.get(b) {
-        Some(next) => next.start.max(start),
-        None => cue.end.max(start),
-    };
-    Cue {
-        index,
-        start,
-        end,
-        text,
-        words: toks[a..b]
-            .iter()
-            .map(|t| Word {
-                text: t.text.clone(),
-                start: t.start,
-                end: t.end,
-                score: 1.0,
-            })
-            .collect(),
-        source_path: cue.source_path.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segmenter::{boundary, score, stem, tokens, Tok, DANGLING, PREPOSITIONS};
 
     fn cue(text: &str, start: f64, end: f64) -> Cue {
         let mut words = Vec::new();

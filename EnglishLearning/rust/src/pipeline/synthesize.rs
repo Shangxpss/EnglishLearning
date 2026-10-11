@@ -40,6 +40,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
+use crate::logs;
 use crate::media;
 use crate::models::Cue;
 use crate::pipeline::checkpoint;
@@ -323,6 +324,14 @@ fn synthesize_cues_inner(
     }
 
     let total = cues.len();
+    if !audio.is_empty() {
+        logs::debug(
+            "dub",
+            "reused synthesized sentence clips from the checkpoint",
+        )
+        .detail(format!("{} of {} sentence(s)", audio.len(), total))
+        .send();
+    }
     let mut failures = SynthFailures::default();
     // Report where we already are before the first worker starts.
     on_progress(SynthProgress {
@@ -377,6 +386,13 @@ fn synthesize_cues_inner(
                             eprintln!("sentence-video: cannot checkpoint sentence #{}: {e}", i + 1);
                         }
                     }
+                    logs::debug("dub", format!("synthesized sentence #{}", i + 1))
+                        .detail(format!(
+                            "{:.2}s · {} char(s)",
+                            samples.len() as f64 / sr,
+                            text.chars().count()
+                        ))
+                        .send();
                     audio.push((i, samples));
                 }
                 Err((e, dur)) => {
@@ -387,6 +403,9 @@ fn synthesize_cues_inner(
                             attempt + 1
                         );
                     }
+                    logs::debug("dub", format!("sentence #{} failed to synthesize", i + 1))
+                        .detail(format!("attempt {} · {e}", attempt + 1))
+                        .send();
                     // Pass 2 never sees a rejected sentence — it only speeds up
                     // clips that *passed* — so a sentence the engine read below
                     // the rate floor must be retried faster here, or it fails

@@ -1,6 +1,7 @@
 //! Application state + request routing.
 
 use crate::db::{Progress, SourceKey, Store};
+use crate::logs;
 use crate::media;
 use crate::models::{Cue, Session};
 use crate::pipeline::checkpoint;
@@ -184,6 +185,10 @@ pub struct AppState {
     /// failure reason (`"failed: …"`). A missing entry with no cached file
     /// means "not started yet".
     playable_jobs: Arc<Mutex<HashMap<String, String>>>,
+    /// Mux jobs, keyed by media path: `"running"` or the failure reason
+    /// (`"failed: …"`). A missing entry with no muxed file means "not muxed".
+    /// Every finished dub muxes itself, so the player can stream one file.
+    mux_jobs: Arc<Mutex<HashMap<String, String>>>,
     /// Dubbing jobs, keyed by session id. A missing entry means "never asked".
     dub_jobs: Arc<Mutex<HashMap<String, DubJob>>>,
     /// Platform-subtitle exports in flight, keyed by session id: `"running"` or
@@ -210,6 +215,7 @@ impl AppState {
             cache_dir,
             data_dir,
             playable_jobs: Arc::new(Mutex::new(HashMap::new())),
+            mux_jobs: Arc::new(Mutex::new(HashMap::new())),
             dub_jobs: Arc::new(Mutex::new(HashMap::new())),
             platform_jobs: Arc::new(Mutex::new(HashMap::new())),
             build_jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -224,18 +230,7 @@ impl AppState {
     /// Keyed by the media path plus its size and mtime, so replacing or editing
     /// the file yields a new entry rather than a stale picture.
     fn playable_path(&self, media_path: &str) -> Option<std::path::PathBuf> {
-        let codec = media::video_codec(media_path).ok().flatten()?;
-        if media::browser_playable_video_codec(&codec) {
-            return None;
-        }
-        // The recipe tag is part of the key so a copy produced by an older
-        // ffmpeg invocation is re-made rather than reused.
-        let key = format!("{}|{PLAYABLE_RECIPE}", media_cache_key(media_path)?);
-        Some(
-            self.data_dir
-                .join("h264")
-                .join(format!("{:016x}.mp4", checkpoint::fnv1a(&key))),
-        )
+        playable_copy_path(&self.data_dir, media_path)
     }
 
     /// Where this media's transcription/alignment checkpoints live.
@@ -427,15 +422,29 @@ impl AppState {
         let src = media_path.to_string();
         std::thread::spawn(move || {
             println!("sentence-video: re-encoding '{src}' to H.264 so the browser can show it…");
+            logs::info("transcode", "re-encoding the source to H.264")
+                .media(&src)
+                .send();
+            let started = std::time::Instant::now();
             let result = media::transcode_to_h264(&src, &dst.to_string_lossy(), None);
             let mut jobs = jobs.lock().unwrap();
             match result {
                 Ok(()) => {
                     jobs.remove(&key);
                     println!("sentence-video: browser-playable copy → {}", dst.display());
+                    logs::info("transcode", "browser-playable copy written")
+                        .media(&src)
+                        .detail(dst.display().to_string())
+                        .duration_ms(started.elapsed().as_millis() as i64)
+                        .send();
                 }
                 Err(e) => {
                     eprintln!("sentence-video: re-encoding '{src}' failed: {e}");
+                    logs::error("transcode", "re-encoding to H.264 failed")
+                        .media(&src)
+                        .detail(&e)
+                        .duration_ms(started.elapsed().as_millis() as i64)
+                        .send();
                     jobs.insert(key, format!("failed: {e}"));
                 }
             }
@@ -471,24 +480,61 @@ impl AppState {
     /// "Re-mux" button, or another session over the same media — overwrites the
     /// first instead of accumulating session-suffixed copies.
     fn muxed_path(&self, media_path: &str) -> std::path::PathBuf {
-        let name = Path::new(media_path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "video".to_string());
-        self.data_dir.join("muxed").join(format!("{name}.mp4"))
+        muxed_file_path(&self.data_dir, media_path)
     }
 
-    /// The `muxed` object the Manage page reads. The file *is* the state, so a
-    /// finished mux survives a server restart with nothing else to persist.
+    /// The `muxed` object the Manage page reads. A finished mux leaves a file, so
+    /// it survives a server restart with nothing else to persist; a mux still in
+    /// flight reports `running` from [`Self::mux_jobs`].
     fn muxed_state(&self, media_path: &str) -> serde_json::Value {
-        let path = self.muxed_path(media_path);
-        match path.is_file() {
-            true => serde_json::json!({
+        let path = muxed_file_path(&self.data_dir, media_path);
+        if path.is_file() {
+            return serde_json::json!({
                 "state": "done",
                 "path": path.to_string_lossy(),
-            }),
-            false => serde_json::json!({ "state": "idle", "path": serde_json::Value::Null }),
+            });
         }
+        let job = self.mux_jobs.lock().unwrap().get(media_path).cloned();
+        match job.as_deref() {
+            Some("running") => {
+                serde_json::json!({ "state": "running", "path": serde_json::Value::Null })
+            }
+            Some(reason) => serde_json::json!({
+                "state": "failed",
+                "path": serde_json::Value::Null,
+                "error": reason,
+            }),
+            None => serde_json::json!({ "state": "idle", "path": serde_json::Value::Null }),
+        }
+    }
+
+    /// Start the mux in the background when a dubbed session has no muxed file
+    /// yet and no job is in flight.
+    ///
+    /// Dubbing muxes itself the moment it finishes, so this only matters for a
+    /// session whose voice track predates auto-mux — opening it should still end
+    /// with one file to play rather than leaving the player on per-sentence
+    /// clips. Never blocks the request.
+    fn ensure_muxed_async(&self, session: &Session) {
+        if !self.is_dubbed(&session.id) {
+            return;
+        }
+        if self.muxed_path(&session.media_path).is_file() {
+            return;
+        }
+        if self
+            .mux_jobs
+            .lock()
+            .unwrap()
+            .contains_key(&session.media_path)
+        {
+            return;
+        }
+        let data_dir = self.data_dir.clone();
+        let media_path = session.media_path.clone();
+        let track = self.dubbed_track_path(&session.id);
+        let jobs = Arc::clone(&self.mux_jobs);
+        std::thread::spawn(move || auto_mux(&data_dir, &media_path, &track, &jobs));
     }
 
     /// The `platform_subtitle` object the Manage page reads. As with `muxed`,
@@ -540,6 +586,15 @@ impl AppState {
         let media_path = session.media_path.clone();
         let jobs = Arc::clone(&self.platform_jobs);
         let id = session.id.clone();
+        logs::info("platform", "exporting the video-platform subtitle")
+            .session(&session.id)
+            .media(&session.media_path)
+            .detail(if track.is_some() {
+                "source=dubbed voice"
+            } else {
+                "source=original audio"
+            })
+            .send();
         std::thread::spawn(move || {
             let result = write_platform_subtitle(&cues, track.as_deref(), &media_path);
             let mut jobs = jobs.lock().unwrap();
@@ -547,9 +602,19 @@ impl AppState {
                 Ok(path) => {
                     jobs.remove(&id);
                     println!("sentence-video: platform subtitle → {path}");
+                    logs::info("platform", "platform subtitle written")
+                        .session(&id)
+                        .media(&media_path)
+                        .detail(path)
+                        .send();
                 }
                 Err(e) => {
                     eprintln!("sentence-video: platform subtitle failed: {e}");
+                    logs::error("platform", "platform subtitle export failed")
+                        .session(&id)
+                        .media(&media_path)
+                        .detail(&e)
+                        .send();
                     jobs.insert(id, format!("failed: {e}"));
                 }
             }
@@ -631,8 +696,19 @@ impl AppState {
             session.media_path,
             voice.unwrap_or("engine default")
         );
+        logs::info("dub", "dubbing started")
+            .session(&session.id)
+            .media(&session.media_path)
+            .detail(format!(
+                "engine={engine} · voice={} · sentences={total}",
+                voice.unwrap_or("engine default")
+            ))
+            .send();
 
         let jobs = Arc::clone(&self.dub_jobs);
+        let mux_jobs = Arc::clone(&self.mux_jobs);
+        let data_dir = self.data_dir.clone();
+        let media_path = session.media_path.clone();
         let id = session.id.clone();
         let cues = session.cues.clone();
         let duration = session.media_duration;
@@ -713,10 +789,234 @@ impl AppState {
                     DubJob::Failed { error: e }
                 }
             };
+            // Record how the run ended before handing the state to the poller.
+            match &outcome {
+                DubJob::Finished {
+                    synthesized,
+                    total,
+                    failed,
+                } if failed.is_empty() => {
+                    logs::info("dub", "dubbing finished")
+                        .session(&id)
+                        .media(&media_path)
+                        .detail(format!("synthesized={synthesized}/{total}"))
+                        .send();
+                }
+                DubJob::Finished {
+                    synthesized,
+                    total,
+                    failed,
+                } => {
+                    logs::warn(
+                        "dub",
+                        "dubbing finished with sentences that could not be dubbed",
+                    )
+                    .session(&id)
+                    .media(&media_path)
+                    .detail(format!(
+                        "synthesized={synthesized}/{total} · failed={} · {}",
+                        failed.len(),
+                        failed
+                            .iter()
+                            .map(|f| format!("#{} {}", f.index, f.error))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ))
+                    .send();
+                }
+                DubJob::Failed { error } => {
+                    logs::error("dub", "dubbing failed")
+                        .session(&id)
+                        .media(&media_path)
+                        .detail(error)
+                        .send();
+                }
+                DubJob::Running { .. } => {}
+            }
             jobs.lock().unwrap().insert(id, outcome);
+
+            // One file to play: mux the replacement voice into the video so the
+            // player streams a single track instead of keeping a separate voice
+            // track in sync. Best-effort and on this background thread — a
+            // failure leaves the player on its per-sentence clips.
+            if track.is_file() {
+                auto_mux(&data_dir, &media_path, &track, &mux_jobs);
+            }
         });
 
         Ok(self.dub_status(session))
+    }
+}
+
+/// Where the browser-playable (H.264) copy of `media_path` lives, or `None`
+/// when no copy is needed — the video codec already plays in a browser, or the
+/// file has no video stream at all.
+///
+/// The free-function form exists so the dubbing thread can work out the path
+/// without an `AppState`; [`AppState::playable_path`] delegates here.
+fn playable_copy_path(data_dir: &Path, media_path: &str) -> Option<std::path::PathBuf> {
+    let codec = media::video_codec(media_path).ok().flatten()?;
+    if media::browser_playable_video_codec(&codec) {
+        return None;
+    }
+    // The recipe tag is part of the key so a copy produced by an older ffmpeg
+    // invocation is re-made rather than reused.
+    let key = format!("{}|{PLAYABLE_RECIPE}", media_cache_key(media_path)?);
+    Some(
+        data_dir
+            .join("h264")
+            .join(format!("{:016x}.mp4", checkpoint::fnv1a(&key))),
+    )
+}
+
+/// Where this media's muxed video — the video stream with the replacement voice
+/// track as its audio — is written: `muxed/<stem>.mp4`.
+///
+/// Its own folder, named after the **source** file, so the result sits under a
+/// name the user already recognises. One media file maps to exactly one muxed
+/// file, so a re-mux overwrites rather than accumulating copies.
+fn muxed_file_path(data_dir: &Path, media_path: &str) -> std::path::PathBuf {
+    let name = Path::new(media_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "video".to_string());
+    data_dir.join("muxed").join(format!("{name}.mp4"))
+}
+
+/// Copy `media_path`'s video stream and the replacement voice `track` into one
+/// MP4 under `data_dir/muxed/`, re-encoding only the audio.
+///
+/// Synchronous on purpose: the video stream is copied, not re-encoded, so this
+/// is seconds where dubbing is minutes. The browser-playable H.264 copy is the
+/// video source when one exists, so the result plays in a browser too.
+fn mux_video_into(
+    data_dir: &Path,
+    media_path: &str,
+    track: &Path,
+) -> Result<std::path::PathBuf, String> {
+    let video = playable_copy_path(data_dir, media_path)
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| media_path.to_string());
+    let dst = muxed_file_path(data_dir, media_path);
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    // The output format is guessed from the file name, so the temp file has to
+    // keep an `.mp4` extension — a bare `.part` suffix makes the muxer refuse
+    // the path outright ("Invalid argument") before any work starts. A unique
+    // id keeps two concurrent muxes of the same media off one scratch path.
+    let tmp = dst.with_file_name(format!(
+        "{}.{}.part.mp4",
+        dst.file_stem().unwrap_or_default().to_string_lossy(),
+        gen_id()
+    ));
+    let tmp = tmp.to_string_lossy().into_owned();
+    println!(
+        "sentence-video: muxing '{video}' + '{}' → {}",
+        track.display(),
+        dst.display()
+    );
+    logs::info("mux", "muxing the video and the dubbed voice")
+        .media(media_path)
+        .detail(format!(
+            "video={video} · track={} · out={}",
+            track.display(),
+            dst.display()
+        ))
+        .send();
+    let bitrate = crate::pipeline::DubOptions::default().audio_bitrate;
+    if let Err(e) = media::mux_video_audio(
+        &video,
+        &track.to_string_lossy(),
+        &tmp,
+        bitrate,
+        // The track is a full-length timeline, so trimming it to the video is
+        // what a correct output needs — the same `-shortest` the CLI uses.
+        true,
+    ) {
+        let _ = std::fs::remove_file(&tmp);
+        logs::error("mux", "muxing failed")
+            .media(media_path)
+            .detail(&e)
+            .send();
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dst) {
+        let _ = std::fs::remove_file(&tmp);
+        logs::error("mux", "cannot move the muxed file into place")
+            .media(media_path)
+            .detail(&e)
+            .send();
+        return Err(format!("cannot move the muxed file into place: {e}"));
+    }
+    println!("sentence-video: muxed video → {}", dst.display());
+    logs::info("mux", "muxed video written")
+        .media(media_path)
+        .detail(dst.display().to_string())
+        .send();
+    Ok(dst)
+}
+
+/// Mux a freshly dubbed session so the player can stream one file (video +
+/// replacement voice) instead of keeping a separate voice track in sync.
+///
+/// Best-effort and blocking (the caller runs on a background thread): a failure
+/// is recorded in `mux_jobs` and the player simply falls back to its
+/// per-sentence clips, so this never breaks a working session.
+fn auto_mux(
+    data_dir: &Path,
+    media_path: &str,
+    track: &Path,
+    mux_jobs: &Mutex<HashMap<String, String>>,
+) {
+    if muxed_file_path(data_dir, media_path).is_file() {
+        return;
+    }
+    // Claim the media path so two callers (a finished dub and a session being
+    // opened) cannot mux it at once.
+    {
+        let mut jobs = mux_jobs.lock().unwrap();
+        if jobs.get(media_path).map_or(false, |s| s == "running") {
+            return;
+        }
+        jobs.insert(media_path.to_string(), "running".to_string());
+    }
+    // A source the browser cannot decode must be muxed from its H.264 copy —
+    // muxing the original would just produce another unplayable file. That copy
+    // is re-encoded at session build time and dubbing takes far longer, so it is
+    // normally already there; wait briefly if it is not.
+    if let Some(copy) = playable_copy_path(data_dir, media_path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !copy.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if !copy.is_file() {
+            mux_jobs.lock().unwrap().insert(
+                media_path.to_string(),
+                "failed: the browser-playable copy is not ready".to_string(),
+            );
+            logs::warn(
+                "mux",
+                "auto-mux gave up: the browser-playable copy is not ready",
+            )
+            .media(media_path)
+            .send();
+            return;
+        }
+    }
+    match mux_video_into(data_dir, media_path, track) {
+        Ok(_) => {
+            mux_jobs.lock().unwrap().remove(media_path);
+        }
+        Err(e) => {
+            eprintln!("sentence-video: auto-mux of '{media_path}' failed: {e}");
+            mux_jobs
+                .lock()
+                .unwrap()
+                .insert(media_path.to_string(), format!("failed: {e}"));
+        }
     }
 }
 
@@ -780,8 +1080,71 @@ fn gen_id() -> String {
     )
 }
 
+/// Paths that must NOT be logged per request. Video streaming issues a stream of
+/// `Range` requests (one per seek/buffer) and the Logs page polls `/api/logs`
+/// itself, so recording either would flood the database and — for `/api/logs` —
+/// feed the page its own traffic. Static assets are omitted for the same reason.
+fn should_log_request(path: &str) -> bool {
+    const SKIP: &[&str] = &["/", "/index.html", "/app.js", "/styles.css", "/health"];
+    if SKIP.contains(&path) {
+        return false;
+    }
+    if path.starts_with("/api/logs") {
+        return false;
+    }
+    // Media streams: the video, its audio, the dubbed voice, the muxed file and
+    // per-sentence clips are all high-frequency Range reads.
+    const STREAM_SUFFIXES: &[&str] = &["/media", "/dubbed-audio", "/muxed", "/audio"];
+    if STREAM_SUFFIXES.iter().any(|s| path.ends_with(s)) {
+        return false;
+    }
+    true
+}
+
+/// Severity for a completed request: server errors are `error`, client errors
+/// are `warn`, everything else is `info`.
+fn level_for_status(status: u16) -> logs::Level {
+    if status >= 500 {
+        logs::Level::Error
+    } else if status >= 400 {
+        logs::Level::Warn
+    } else {
+        logs::Level::Info
+    }
+}
+
 impl Handler for AppState {
+    /// The single chokepoint every HTTP request passes through: time the
+    /// dispatch, then record it (except on the high-frequency paths listed in
+    /// [`should_log_request`]) so the log database carries a request timeline.
     fn handle(&self, req: &Request) -> Response {
+        let started = std::time::Instant::now();
+        let res = self.dispatch(req);
+        if should_log_request(&req.path) {
+            let mut entry = logs::log(
+                level_for_status(res.status),
+                "http",
+                format!("{} {} → {}", req.method, req.path, res.status),
+            )
+            .duration_ms(started.elapsed().as_millis() as i64);
+            // The JSON error body is the most useful part of a failed request.
+            if res.status >= 400 {
+                if let Ok(body) = std::str::from_utf8(&res.body) {
+                    if !body.is_empty() {
+                        entry = entry.detail(body.to_string());
+                    }
+                }
+            }
+            entry.send();
+        }
+        res
+    }
+}
+
+impl AppState {
+    /// Match a request to its handler. Separated from [`Handler::handle`] so the
+    /// logging wrapper can time and record every route from one place.
+    fn dispatch(&self, req: &Request) -> Response {
         let path = req.path.as_str();
         match (req.method.as_str(), path) {
             ("GET", "/") | ("GET", "/index.html") => {
@@ -793,6 +1156,11 @@ impl Handler for AppState {
             ("GET", "/styles.css") => bytes_ok(STYLES_CSS.as_bytes(), "text/css; charset=utf-8"),
             ("GET", "/health") => Response::text(200, "application/json", r#"{"status":"ok"}"#),
             ("GET", "/api/sessions") => self.list_sessions(),
+
+            // The log database: read, aggregate, or clear it.
+            ("GET", "/api/logs") => self.list_logs(req),
+            ("GET", "/api/logs/stats") => self.log_stats(),
+            ("DELETE", "/api/logs") => self.clear_logs(),
 
             // Media being processed right now. A build has no session id until
             // it ends, so it cannot be reported by `/api/sessions`.
@@ -936,8 +1304,18 @@ impl AppState {
     ) -> Result<Session, (u16, String)> {
         let media_path = media::normalize_path(media_path);
         if !Path::new(&media_path).is_file() {
+            logs::error("build", "media file not found")
+                .media(&media_path)
+                .send();
             return Err((404, format!("media file not found: {media_path}")));
         }
+        logs::info("build", "building session")
+            .media(&media_path)
+            .detail(format!(
+                "force={force} · align={align} · subtitle={}",
+                subtitle_path.as_deref().unwrap_or("auto")
+            ))
+            .send();
         let media_duration = media::probe_duration(&media_path).map_err(|e| (500, e))?;
 
         // Cue source, in priority order:
@@ -963,6 +1341,11 @@ impl AppState {
         // Checked before transcribing, so a repeat selection is instant.
         if !force {
             if let Some(existing) = self.db.find_by_source(&key) {
+                logs::debug("build", "reusing the cached session")
+                    .media(&media_path)
+                    .session(&existing.id)
+                    .detail(format!("{} cue(s)", existing.cues.len()))
+                    .send();
                 self.sessions
                     .lock()
                     .unwrap()
@@ -1005,8 +1388,19 @@ impl AppState {
                         // Cancelling is not a failure: the request that started
                         // the build reports it as a clean "stopped", and the
                         // checkpoints stay on disk so a later attempt resumes.
-                        Err(e) if e == transcribe::CANCELLED => return Err((409, e)),
-                        Err(e) => return Err((422, format!("transcription failed: {e}"))),
+                        Err(e) if e == transcribe::CANCELLED => {
+                            logs::warn("build", "build cancelled")
+                                .media(&media_path)
+                                .send();
+                            return Err((409, e));
+                        }
+                        Err(e) => {
+                            logs::error("build", "transcription failed")
+                                .media(&media_path)
+                                .detail(&e)
+                                .send();
+                            return Err((422, format!("transcription failed: {e}")));
+                        }
                     }
                 };
                 if let Some(path) = &saved {
@@ -1036,6 +1430,16 @@ impl AppState {
         self.db
             .insert_session(&session, &key)
             .map_err(|e| (500, format!("cannot persist session: {e}")))?;
+        logs::info("build", "session ready")
+            .session(&id)
+            .media(&session.media_path)
+            .detail(format!(
+                "{} cue(s) · source={} · {:.1}s",
+                session.cues.len(),
+                session.source_format,
+                session.media_duration
+            ))
+            .send();
         self.sessions.lock().unwrap().insert(id, session.clone());
         Ok(session)
     }
@@ -1097,6 +1501,59 @@ impl AppState {
         }
     }
 
+    /// `GET /api/logs` — one page of the log database, newest first.
+    ///
+    /// Query params: `level`, `category`, `session`, `media`, `q`, `since_ms`,
+    /// `before_id`, `limit`. The response bundles `records`, their `total`, and
+    /// `stats` so the Logs page fills its table and header from one round trip.
+    fn list_logs(&self, req: &Request) -> Response {
+        let p = &req.query;
+        let query = logs::Query {
+            level: p.get("level").and_then(|l| logs::Level::from_str(l)),
+            category: p.get("category").filter(|c| !c.is_empty()).cloned(),
+            session_id: p.get("session").filter(|s| !s.is_empty()).cloned(),
+            media: p.get("media").filter(|m| !m.is_empty()).cloned(),
+            q: p.get("q").filter(|s| !s.is_empty()).cloned(),
+            since_ms: p.get("since_ms").and_then(|v| v.parse().ok()),
+            before_id: p.get("before_id").and_then(|v| v.parse().ok()),
+            limit: p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(500),
+        };
+        let records = match logs::query(&query) {
+            Ok(r) => r,
+            Err(e) => return Response::error(500, &e),
+        };
+        let stats = logs::stats().unwrap_or_else(|_| serde_json::json!({}));
+        let body = serde_json::json!({
+            "records": records,
+            "total": records.len(),
+            "stats": stats,
+        });
+        match serde_json::to_string(&body) {
+            Ok(body) => Response::text(200, "application/json; charset=utf-8", body),
+            Err(e) => Response::error(500, &e.to_string()),
+        }
+    }
+
+    /// `GET /api/logs/stats` — counts the Logs page header shows.
+    fn log_stats(&self) -> Response {
+        match logs::stats().and_then(|v| serde_json::to_string(&v).map_err(|e| e.to_string())) {
+            Ok(body) => Response::text(200, "application/json; charset=utf-8", body),
+            Err(e) => Response::error(500, &e),
+        }
+    }
+
+    /// `DELETE /api/logs` — wipe the log database; reports how many rows went.
+    fn clear_logs(&self) -> Response {
+        match logs::clear() {
+            Ok(n) => Response::text(
+                200,
+                "application/json; charset=utf-8",
+                format!("{{\"cleared\": {n}}}"),
+            ),
+            Err(e) => Response::error(500, &e),
+        }
+    }
+
     /// `GET /api/builds` — the media being processed right now, longest first.
     ///
     /// Exists because a build is synchronous: the session row is written only
@@ -1152,6 +1609,9 @@ impl AppState {
         match cancelled {
             true => {
                 println!("sentence-video: cancelling the build of '{media_path}'");
+                logs::warn("build", "cancellation requested")
+                    .media(&media_path)
+                    .send();
                 Response::text(
                     200,
                     "application/json; charset=utf-8",
@@ -1299,59 +1759,13 @@ impl AppState {
         if !track.is_file() {
             return Response::error(409, "this session has no voice track to mux — dub it first");
         }
-        // Mux the H.264 copy when there is one: it is the file the browser is
-        // already playing, and H.264 + AAC plays everywhere. A source the
-        // browser can decode needs no copy and is remuxed as-is.
-        let video = self
-            .playable_path(&session.media_path)
-            .filter(|p| p.is_file())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| session.media_path.clone());
-        let dst = self.muxed_path(&session.media_path);
-        if let Some(dir) = dst.parent() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                return Response::error(500, &format!("cannot create {}: {e}", dir.display()));
-            }
+        match mux_video_into(&self.data_dir, &session.media_path, &track) {
+            Ok(_) => bytes_ok(
+                self.muxed_state(&session.media_path).to_string().as_bytes(),
+                "application/json; charset=utf-8",
+            ),
+            Err(e) => Response::error(500, &e),
         }
-        // The output format is guessed from the file name, so the temp file has
-        // to keep an `.mp4` extension — a bare `.part` suffix makes the muxer
-        // refuse the path outright ("Invalid argument") before any work starts.
-        // The session id is what keeps this temp name unique: the finished file
-        // is shared per media, so two sessions muxing at once must not encode
-        // into the same scratch path.
-        let tmp = dst.with_file_name(format!(
-            "{}.{}.part.mp4",
-            dst.file_stem().unwrap_or_default().to_string_lossy(),
-            session.id
-        ));
-        let tmp = tmp.to_string_lossy().into_owned();
-        println!(
-            "sentence-video: muxing '{video}' + '{}' → {}",
-            track.display(),
-            dst.display()
-        );
-        let bitrate = crate::pipeline::DubOptions::default().audio_bitrate;
-        if let Err(e) = media::mux_video_audio(
-            &video,
-            &track.to_string_lossy(),
-            &tmp,
-            bitrate,
-            // The track is a full-length timeline, so trimming it to the video
-            // is what a correct output needs — the same `-shortest` the CLI uses.
-            true,
-        ) {
-            let _ = std::fs::remove_file(&tmp);
-            return Response::error(500, &e);
-        }
-        if let Err(e) = std::fs::rename(&tmp, &dst) {
-            let _ = std::fs::remove_file(&tmp);
-            return Response::error(500, &format!("cannot move the muxed file into place: {e}"));
-        }
-        println!("sentence-video: muxed video → {}", dst.display());
-        bytes_ok(
-            self.muxed_state(&session.media_path).to_string().as_bytes(),
-            "application/json; charset=utf-8",
-        )
     }
 
     /// `POST /api/session/{id}/platform-subtitle` with an empty body starts (or
@@ -1441,6 +1855,9 @@ impl AppState {
                 // codec, and opening a session is what starts the H.264
                 // re-encode of a source the browser cannot play.
                 self.ensure_playable_async(&session.media_path);
+                // A dubbed session whose voice track predates auto-mux still has
+                // no single file to play; opening it is the trigger to make one.
+                self.ensure_muxed_async(&session);
                 let mut value = match serde_json::to_value(&session) {
                     Ok(v) => v,
                     Err(e) => return Response::error(500, &e.to_string()),

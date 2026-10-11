@@ -20,6 +20,7 @@ mod align;
 mod app;
 mod asr;
 mod db;
+mod logs;
 mod media;
 mod models;
 mod picker;
@@ -71,7 +72,10 @@ fn print_usage() {
          \x20   --dub-voice <name>     voice for that backend; default en-GB-MaisieNeural\n\
          \x20                         for edge-tts (also SENTENCE_VIDEO_DUB_VOICE)\n\
          \x20   --dub-proxy <url>      proxy for edge-tts, which ignores https_proxy\n\
-         \x20                         (also SENTENCE_VIDEO_DUB_PROXY)\n\n\
+         \x20                         (also SENTENCE_VIDEO_DUB_PROXY)\n\
+         \x20   --log-level <level>    debug|info|warn|error for the log database\n\
+         \x20                         (default: debug; also SENTENCE_VIDEO_LOG_LEVEL)\n\
+         \x20   --no-log-file          keep logs in logs.db only, no text mirror\n\n\
          REPLACE-AUDIO (batch, replaces a video's audio with a supplied track):\n\
          \x20   <video>    media whose audio will be replaced\n\
          \x20   <audio>    new audio track (mp3/wav/m4a/…)\n\
@@ -668,6 +672,8 @@ fn main() {
     let mut dub_engine: Option<String> = None;
     let mut dub_voice: Option<String> = None;
     let mut dub_proxy: Option<String> = None;
+    let mut log_level: Option<String> = None;
+    let mut no_log_file = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -697,6 +703,13 @@ fn main() {
                 }
             }
             "--align" => align = true,
+            "--log-level" => {
+                i += 1;
+                if let Some(l) = args.get(i) {
+                    log_level = Some(l.clone());
+                }
+            }
+            "--no-log-file" => no_log_file = true,
             "--dub-engine" => {
                 i += 1;
                 dub_engine = args.get(i).cloned();
@@ -734,12 +747,41 @@ fn main() {
 
     let cache_dir = std::env::temp_dir().join("sentence-video-cache");
     let data_dir = resolve_data_dir(data_dir);
+
+    // Logging: a `logs.db` beside the session database, mirrored to a text file
+    // so the log can also be `tail`ed outside the app. Initialized before the
+    // session database so a failure opening *that* is itself recorded.
+    let log_level = log_level
+        .or_else(|| env_setting("SENTENCE_VIDEO_LOG_LEVEL"))
+        .and_then(|l| logs::Level::from_str(&l))
+        .unwrap_or(logs::Level::Debug);
+    let log_mirror = (!no_log_file).then(|| data_dir.join("logs").join("sentence-video.log"));
+    let logs_db = data_dir.join("logs.db");
+    if let Err(e) = logs::init(&logs_db, log_mirror.clone(), log_level) {
+        eprintln!("sentence-video: logging disabled: {e}");
+    }
+    logs::info("server", "starting")
+        .detail(format!(
+            "data_dir={} · logs.db={} · mirror={} · log_level={}",
+            data_dir.display(),
+            logs_db.display(),
+            log_mirror
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "off".to_string()),
+            log_level.as_str(),
+        ))
+        .send();
+
     let db_path = data_dir.join("sessions.db");
     // Which storage engine this is stays entirely here: the rest of the app only
     // ever sees `dyn Store`, so swapping the backend never touches request code.
     let db: Arc<dyn db::Store> = match db::Db::open(&db_path) {
         Ok(db) => {
             println!("sentence-video: session database → {}", db_path.display());
+            logs::info("db", "session database opened")
+                .detail(db_path.display().to_string())
+                .send();
             Arc::new(db)
         }
         Err(e) => {
@@ -750,10 +792,22 @@ fn main() {
                 "sentence-video: {e}; falling back to {}",
                 fallback_dir.join("sessions.db").display()
             );
+            logs::error(
+                "db",
+                "cannot open the session database — using a temp database",
+            )
+            .detail(format!(
+                "{e} · fallback={}",
+                fallback_dir.join("sessions.db").display()
+            ))
+            .send();
             match db::Db::open(&fallback_dir.join("sessions.db")) {
                 Ok(db) => Arc::new(db),
                 Err(e) => {
                     eprintln!("sentence-video: cannot open a session database: {e}");
+                    logs::error("db", "cannot open any session database; exiting")
+                        .detail(e)
+                        .send();
                     std::process::exit(1);
                 }
             }
@@ -773,6 +827,9 @@ fn main() {
     let dub_voice = dub_voice.or_else(|| env_setting("SENTENCE_VIDEO_DUB_VOICE"));
     let dub_proxy = dub_proxy.or_else(|| env_setting("SENTENCE_VIDEO_DUB_PROXY"));
     println!("sentence-video: dubbing engine → {dub_engine}");
+    logs::info("dub", "dubbing engine configured")
+        .detail(format!("engine={dub_engine}"))
+        .send();
     pipeline::init_dub(pipeline::DubConfig {
         engine: dub_engine,
         voice: dub_voice,
@@ -797,11 +854,20 @@ fn main() {
             "sentence-video: speech-to-text model → {}",
             asr::model_description(asr_model)
         );
+        logs::info("asr", "speech-to-text ready")
+            .detail(format!(
+                "model={} · align={align}",
+                asr::model_description(asr_model)
+            ))
+            .send();
     } else {
         eprintln!(
             "sentence-video: speech-to-text unavailable: {}",
             asr::NO_MODEL_HELP
         );
+        logs::warn("asr", "speech-to-text unavailable")
+            .detail(asr::NO_MODEL_HELP)
+            .send();
     }
 
     // Auto-create (or resume) a session when a media file was passed in.
@@ -818,6 +884,13 @@ fn main() {
             }
             Err((status, msg)) => {
                 eprintln!("sentence-video: cannot open media ({status}): {msg}");
+                logs::error(
+                    "session",
+                    "cannot open the media passed on the command line",
+                )
+                .media(mp.clone())
+                .detail(format!("status={status} · {msg}"))
+                .send();
                 if std::env::args().skip(1).len() > 0 {
                     // Keep serving so the user can still POST a valid session.
                     eprintln!("sentence-video: starting an empty workspace instead.");
@@ -830,6 +903,9 @@ fn main() {
     let state_arc: Arc<app::AppState> = Arc::clone(&state);
     let handler: Arc<dyn server::Handler + Send + Sync> = state_arc;
     let addr = server::start(&bind, handler);
+    logs::info("server", "listening")
+        .detail(format!("http://{addr}/"))
+        .send();
 
     // Open the browser once the server reports a bound address.
     if open_browser_flag {

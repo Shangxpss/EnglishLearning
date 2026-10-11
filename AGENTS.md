@@ -143,9 +143,14 @@ Measured on a 4-minute video, cue ends that immediately voice the next word drop
 genuinely continuous. The player polls the media clock every 20 ms so it stops inside the
 pause (a 60 ms timer allowed ~40 ms of overshoot).
 
-`build_cues` has **no duration or word cap** — cues split only at sentence-final
-punctuation, so they are always complete sentences (an earlier 12 s / 40-word cap sliced
-sentences mid-thought).
+`build_cues` has **no word-count cap** — cues split at sentence-final punctuation, so a
+normal sentence stays whole (an earlier 12 s / 40-word cap sliced sentences mid-thought).
+Whisper punctuates a long monologue with commas alone, though, so a "sentence" can run for
+minutes — which neither the dubber (it rejects a clip past 60 s) nor a reader can use.
+`segmenter::finalize` therefore cuts any cue past **`MAX_CUE_SECS` (20 s)** at the nearest
+natural boundary (the same boundary machinery the platform exporter uses). Because both the
+transcription path and the cached-`_full_sentence.srt` parse run through `finalize`, an
+already-segmented video is fixed on re-open without re-transcribing.
 
 ### Which subtitle a session uses
 

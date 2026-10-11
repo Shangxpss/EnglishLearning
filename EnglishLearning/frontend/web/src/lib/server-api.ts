@@ -42,13 +42,17 @@ export interface VideoStatus {
  * The muxed video: this session's video stream with the replacement voice track
  * as its audio, written to its own folder on the server.
  *
- * The file is the state — `done` means it exists — so there is nothing to poll:
- * the mux is synchronous and the ending state comes back from the POST.
+ * A finished mux leaves a file, so `done` survives a restart with nothing else
+ * to persist. Every finished dub muxes itself in the background, so a session
+ * reports `running` for a few seconds after dubbing ends and the player keeps
+ * polling until it settles.
  */
 export interface MuxedState {
-  state: "idle" | "done";
+  state: "idle" | "running" | "done" | "failed";
   /** Absolute path of the file on the server machine, or `null` until muxed. */
   path: string | null;
+  /** Why the auto-mux failed, when `state` is `failed`. */
+  error?: string;
 }
 
 /**
@@ -350,4 +354,89 @@ export async function openPlatformDir(sessionId: string): Promise<void> {
     { method: "POST" },
   );
   if (!resp.ok) throw new Error(await readError(resp));
+}
+
+// ── Log database (logs.db) ────────────────────────────────────────────────
+//
+// Every request the server handles and every background job it runs is written
+// to a separate `logs.db`, so a problem noticed later can still be traced. The
+// Logs page reads it through these three calls; nothing here is required for
+// playback, so a server built before the logging system simply 404s.
+
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+/** One persisted log line (`GET /api/logs`). */
+export interface LogRecord {
+  id: number;
+  /** Unix epoch milliseconds. */
+  ts_ms: number;
+  level: LogLevel;
+  /** Short subsystem name: `http`, `build`, `asr`, `align`, `dub`, `mux`, … */
+  category: string;
+  message: string;
+  session_id?: string;
+  media_path?: string;
+  /** Extra context — an error body, a window span, a per-sentence duration. */
+  detail?: string;
+  duration_ms?: number;
+}
+
+/** Aggregate counts for the Logs page header (`GET /api/logs/stats`). */
+export interface LogStats {
+  total: number;
+  oldest_ms: number | null;
+  newest_ms: number | null;
+  by_level: Record<string, number>;
+  by_category: Record<string, number>;
+}
+
+/** Filters for `GET /api/logs`. Every field is optional. */
+export interface LogQuery {
+  level?: string;
+  category?: string;
+  /** Match `session_id` exactly. */
+  session?: string;
+  /** Substring of `media_path`. */
+  media?: string;
+  /** Substring of message / detail. */
+  q?: string;
+  /** Only records at or after this epoch-ms (used to tail new lines). */
+  since_ms?: number;
+  limit?: number;
+}
+
+/** One page of logs plus the header counts, from a single round trip. */
+export interface LogPage {
+  records: LogRecord[];
+  total: number;
+  stats: LogStats;
+}
+
+/** `GET /api/logs` — newest first, filtered by any of [`LogQuery`]. */
+export async function getLogs(query: LogQuery = {}): Promise<LogPage> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== "") {
+      params.set(key, String(value));
+    }
+  }
+  const qs = params.toString();
+  const resp = await fetch(`/api/logs${qs ? `?${qs}` : ""}`);
+  if (!resp.ok) throw new Error(await readError(resp));
+  return resp.json();
+}
+
+/** `GET /api/logs/stats` — counts per level and per category. */
+export async function getLogStats(): Promise<LogStats> {
+  const resp = await fetch("/api/logs/stats");
+  if (!resp.ok) throw new Error(await readError(resp));
+  return resp.json();
+}
+
+/** `DELETE /api/logs` — wipe the log table; returns how many rows went. */
+export async function clearLogs(): Promise<number> {
+  const resp = await fetch("/api/logs", { method: "DELETE" });
+  if (!resp.ok) throw new Error(await readError(resp));
+  const data: { cleared: number } = await resp.json();
+  return data.cleared ?? 0;
 }

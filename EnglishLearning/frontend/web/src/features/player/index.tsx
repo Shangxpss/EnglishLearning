@@ -21,9 +21,11 @@ import {
  *   GET  /api/session/{id}/dubbed-audio            → Range-streamed replacement voice track
  *   GET  /api/session/{id}/audio?start=&end=       → exact WAV slice of a time range
  *
- * A session with `dubbed: true` carries a server-generated voice track that
- * replaces the original audio: the video is muted, the track is played
- * alongside it, and the two are kept in sync.
+ * A session with `dubbed: true` carries a server-generated voice track. Once the
+ * server has muxed it into the video (`muxed.state === "done"`) the player
+ * streams that one file, unmuted, so nothing has to be kept in sync. Before the
+ * mux lands it falls back to the video muted plus one short clip per sentence
+ * from `GET /audio?start=&end=`.
  *
  * A session whose source video is a codec browsers cannot decode (HEVC/H.265
  * is common in course exports) reports `video.playable: false`; the server
@@ -70,6 +72,13 @@ interface Session {
   };
   /** How far the server's dubbing job has got (`/dub`). */
   dubbing?: DubbingState;
+  /**
+   * The muxed video (video + dubbed voice in one file). Every finished dub
+   * muxes itself, so this goes `running` → `done` shortly after dubbing ends
+   * and the player then streams that single file instead of keeping a separate
+   * voice track in sync.
+   */
+  muxed?: { state: 'idle' | 'running' | 'done' | 'failed'; path: string | null; error?: string };
 }
 
 /** Persisted "where the user left off" record for a session. */
@@ -97,6 +106,13 @@ function chipClass(active: boolean): string {
   );
 }
 
+/**
+ * How long to keep polling for a dubbed session's auto-mux before giving up and
+ * staying on the per-sentence clips. A session dubbed by an older build has no
+ * auto-mux at all, so without a bound the player would poll forever.
+ */
+const MUX_POLL_MS = 120_000;
+
 export function PlayerPage() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [session, setSession] = useState<Session | null>(null);
@@ -121,8 +137,12 @@ export function PlayerPage() {
   const [deleting, setDeleting] = useState<string | null>(null);
 
   const mediaRef = useRef<HTMLVideoElement | null>(null);
-  /** The replacement voice track, played alongside the muted video. */
-  const dubbedRef = useRef<HTMLAudioElement | null>(null);
+  /** The sentence clip currently playing (dubbed sessions only). */
+  const clipRef = useRef<HTMLAudioElement | null>(null);
+  /** Mirrors `dubbed` for the interval/keyboard handlers. */
+  const dubbedRef = useRef(false);
+  /** Mirrors `useMuxed`: when true the video's own audio is the dubbed voice. */
+  const useMuxedRef = useRef(false);
   const listRef = useRef<HTMLOListElement | null>(null);
   const activeRef = useRef(-1);
   const loopRef = useRef(false);
@@ -139,6 +159,7 @@ export function PlayerPage() {
 
   /** True when the open session carries a server-generated voice track. */
   const dubbed = session?.dubbed === true;
+  dubbedRef.current = dubbed;
   const sessionKey = session?.id;
   /** True once the source video can actually be decoded by this browser. */
   const videoPlayable = session?.video?.playable ?? true;
@@ -147,45 +168,46 @@ export function PlayerPage() {
   /** The server is still rendering sentences; `dubbed` flips when it finishes. */
   const dubbing = session?.dubbing;
   const dubbingRunning = dubbing?.state === 'running';
-
   /**
-   * Point the replacement voice track at the open session. The track is a
-   * sibling `Audio` element rather than the video's own audio, so the video is
-   * muted below and the two are driven together.
+   * A dubbed session with its auto-mux finished plays the muxed file directly:
+   * one stream, so the video is not muted and each sentence is an ordinary seek
+   * into the same file. Until the mux lands (and on sessions dubbed before
+   * auto-mux existed) the player keeps the video muted and plays per-sentence
+   * clips instead.
    */
-  useEffect(() => {
-    if (!sessionKey || !dubbed) {
-      dubbedRef.current?.pause();
-      dubbedRef.current = null;
-      return;
-    }
-    const track = new Audio(
-      `/api/session/${encodeURIComponent(sessionKey)}/dubbed-audio`
-    );
-    track.preload = 'auto';
-    dubbedRef.current = track;
-    return () => {
-      track.pause();
-      dubbedRef.current = null;
-    };
-  }, [sessionKey, dubbed]);
+  const useMuxed = dubbed && session?.muxed?.state === 'done';
+  useMuxedRef.current = useMuxed;
 
-  /** Silence the original audio while the dubbed track is playing. */
+  /** Silence the original audio while a really-dubbed sentence clip plays. */
   useEffect(() => {
     const m = mediaRef.current;
-    if (m) m.muted = dubbed;
-  }, [dubbed, sessionKey]);
+    // Muted only while the voice comes from a separate clip. Once the auto-mux
+    // lands the video carries the dubbed voice itself, so it plays unmuted.
+    if (m) m.muted = dubbed && !useMuxed;
+  }, [dubbed, useMuxed, sessionKey]);
 
   /**
    * While there is server-side work in flight — an H.264 re-encode of a source
-   * this browser cannot decode, or a dubbing run — re-read the session every
-   * few seconds so the player can swap in the video and the voice track the
-   * moment they are ready.
+   * this browser cannot decode, a dubbing run, or the auto-mux that follows it —
+   * re-read the session every few seconds so the player can swap in the video and
+   * the voice track the moment they are ready.
    */
   const transcodePending = !videoPlayable && !videoFailed;
+  /** A dubbed session has no muxed file yet — wait a little for it to appear. */
+  const muxPending =
+    dubbed && session?.muxed?.state !== 'done' && session?.muxed?.state !== 'failed';
   useEffect(() => {
-    if (!sessionKey || (!transcodePending && !dubbingRunning)) return;
+    if (!sessionKey) return;
+    if (!transcodePending && !dubbingRunning && !muxPending) return;
+    // Waiting only on the mux is bounded: an older session has no auto-mux, so
+    // it must settle on the per-sentence clips rather than poll forever.
+    const deadline =
+      muxPending && !dubbingRunning && !transcodePending ? Date.now() + MUX_POLL_MS : 0;
     const t = window.setInterval(() => {
+      if (deadline && Date.now() > deadline) {
+        window.clearInterval(t);
+        return;
+      }
       void fetch(`/api/session/${encodeURIComponent(sessionKey)}`)
         .then((resp) => (resp.ok ? resp.json() : null))
         .then((data: Session | null) => {
@@ -196,26 +218,44 @@ export function PlayerPage() {
         });
     }, 3000);
     return () => window.clearInterval(t);
-  }, [sessionKey, transcodePending, dubbingRunning]);
+  }, [sessionKey, transcodePending, dubbingRunning, muxPending]);
+
+  /** Stop the sentence clip that is currently playing, if any. */
+  const stopClip = useCallback(() => {
+    const c = clipRef.current;
+    if (!c) return;
+    c.pause();
+    clipRef.current = null;
+  }, []);
 
   /**
-   * Mirror the video's transport onto the voice track. `hard` forces the
-   * current time across (after a seek); otherwise only a drift beyond 150 ms
-   * is corrected, so the track is never nudged audibly.
+   * Play one sentence as its own server-decoded clip.
+   *
+   * A dubbed session's replacement voice is a single ~200 MB WAV. Seeking that
+   * track to each sentence made the browser re-buffer on every click: the video
+   * kept running while the track was still loading, so the drift correction
+   * re-seeked it forever and only the first syllable ever came out. Instead the
+   * server slices out exactly `[start, end]` — from the dubbed track when there
+   * is one, otherwise from the source (`route_audio` picks the dubbed track
+   * automatically) — giving a short clip that needs no syncing.
    */
-  const syncDubbed = useCallback((hard: boolean) => {
-    const m = mediaRef.current;
-    const a = dubbedRef.current;
-    if (!m || !a) return;
-    if (hard || Math.abs(a.currentTime - m.currentTime) > 0.15) {
-      a.currentTime = m.currentTime;
-    }
-    a.playbackRate = m.playbackRate;
-    // The video is muted, so volume must come from the track itself.
-    a.volume = m.volume;
-    if (m.paused) a.pause();
-    else void a.play().catch(() => {});
-  }, []);
+  const playClip = useCallback(
+    (i: number) => {
+      const id = sessionIdRef.current;
+      const cs = cuesRef.current;
+      if (!id || i < 0 || i >= cs.length) return;
+      const cue = cs[i];
+      stopClip();
+      const clip = new Audio(
+        `/api/session/${encodeURIComponent(id)}/audio?start=${cue.start}&end=${cue.end}`
+      );
+      const m = mediaRef.current;
+      if (m) clip.volume = m.volume;
+      clipRef.current = clip;
+      void clip.play().catch(() => {});
+    },
+    [stopClip]
+  );
 
   /** Apply a restored position as soon as the media can accept a seek. */
   const applyPendingPosition = useCallback(() => {
@@ -365,10 +405,14 @@ export function PlayerPage() {
       setActiveIdx(i);
       m.currentTime = cs[i].start;
       void m.play().catch(() => {});
+      // A dubbed session without a muxed file plays its voice as a separate
+      // clip: start this sentence's slice. With the muxed file the video itself
+      // carries the dubbed voice, so nothing extra is needed.
+      if (dubbedRef.current && !useMuxedRef.current) playClip(i);
       // Record the sentence as the resume point immediately.
       saveProgress(i, cs[i].start);
     },
-    [saveProgress]
+    [saveProgress, playClip]
   );
 
   // Persist playback progress every few seconds while playing.
@@ -387,8 +431,6 @@ export function PlayerPage() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       const m = mediaRef.current;
-      // Keep the replacement voice track locked to the video it replaces.
-      if (m && dubbedRef.current) syncDubbed(false);
       const cs = cuesRef.current;
       const i = activeRef.current;
       if (!m || i < 0 || i >= cs.length) return;
@@ -397,15 +439,17 @@ export function PlayerPage() {
         if (loopRef.current) {
           m.currentTime = cue.start;
           void m.play().catch(() => {});
+          if (dubbedRef.current && !useMuxedRef.current) playClip(i);
         } else if (throughRef.current && i + 1 < cs.length) {
           playIndex(i + 1);
         } else {
           m.pause();
+          stopClip();
         }
       }
     }, 20);
     return () => window.clearInterval(timer);
-  }, [playIndex, syncDubbed]);
+  }, [playIndex, playClip, stopClip]);
 
   const createSession = useCallback(
     async (overrideMedia?: string, overrideSubtitle?: string) => {
@@ -469,23 +513,6 @@ export function PlayerPage() {
     }
   }, [createSession, subtitlePath]);
 
-  /**
-   * Play one sentence as a server-decoded audio clip. Unlike normal playback
-   * (which seeks the original media in the browser), the Rust server extracts
-   * exactly `[cue.start, cue.end]`, so the boundaries are sample-accurate.
-   */
-  const playClip = useCallback(
-    (i: number) => {
-      const s = session;
-      const cs = cuesRef.current;
-      if (!s || i < 0 || i >= cs.length) return;
-      const cue = cs[i];
-      const url = `/api/session/${encodeURIComponent(s.id)}/audio?start=${cue.start}&end=${cue.end}`;
-      void new Audio(url).play().catch(() => {});
-    },
-    [session]
-  );
-
   // Auto-scroll the active sentence into view.
   useEffect(() => {
     if (activeIdx < 0 || !listRef.current) return;
@@ -538,14 +565,32 @@ export function PlayerPage() {
       .filter(({ cue }) => !q || cue.text.toLowerCase().includes(q));
   }, [cues, filter]);
 
-  // What /media resolves to changes once the server's H.264 copy lands, so the
-  // URL carries the recipe: the browser fetches the copy instead of reusing a
-  // cached response for the original stream it could not decode.
+  // What the media URL resolves to changes once the server's H.264 copy lands,
+  // so the URL carries the recipe: the browser fetches the copy instead of
+  // reusing a cached response for the original stream it could not decode. A
+  // dubbed session switches to the muxed file (video + dubbed voice in one
+  // stream) as soon as the auto-mux finishes.
   const mediaSrc = session
-    ? `/api/session/${encodeURIComponent(session.id)}/media${
-        transcode === 'done' ? '?v=h264' : ''
-      }`
+    ? useMuxed
+      ? `/api/session/${encodeURIComponent(session.id)}/muxed?v=muxed`
+      : `/api/session/${encodeURIComponent(session.id)}/media${
+          transcode === 'done' ? '?v=h264' : ''
+        }`
     : undefined;
+
+  // The media element reloads when its src changes. When the auto-mux lands
+  // mid-playback, resume at the sentence that was playing rather than at zero,
+  // and drop any clip (the new file carries the voice itself).
+  const prevUseMuxedRef = useRef(useMuxed);
+  useEffect(() => {
+    if (prevUseMuxedRef.current === useMuxed) return;
+    prevUseMuxedRef.current = useMuxed;
+    stopClip();
+    const i = activeRef.current;
+    const cs = cuesRef.current;
+    if (i >= 0 && i < cs.length) pendingPositionRef.current = cs[i].start;
+  }, [useMuxed, stopClip]);
+
   const activeCue = activeIdx >= 0 ? cues[activeIdx] : undefined;
 
   return (
@@ -691,15 +736,11 @@ export function PlayerPage() {
                 controls
                 preload="metadata"
                 onLoadedMetadata={applyPendingPosition}
-                onPlay={() => syncDubbed(false)}
                 onPause={() => {
-                  dubbedRef.current?.pause();
+                  stopClip();
                   const m = mediaRef.current;
                   if (m) saveProgress(activeRef.current, m.currentTime);
                 }}
-                onSeeked={() => syncDubbed(true)}
-                onRateChange={() => syncDubbed(false)}
-                onVolumeChange={() => syncDubbed(false)}
                 onEnded={() => {
                   const m = mediaRef.current;
                   if (m) saveProgress(activeRef.current, m.currentTime);
@@ -760,6 +801,17 @@ export function PlayerPage() {
                 {(dubbing.failed?.length ?? 0) > 0
                   ? `${dubbing.failed.length} sentence(s) could not be dubbed and keep a silent slot — resume from the Manage page to retry just those.`
                   : dubbing.error}
+              </p>
+            )}
+            {dubbed && session?.muxed?.state === 'running' && (
+              <p className="text-xs text-muted-foreground">
+                Combining the video and the dubbed voice into one file…
+              </p>
+            )}
+            {dubbed && session?.muxed?.state === 'failed' && (
+              <p className="text-xs text-muted-foreground">
+                Could not combine the video with the dubbed voice — playing it sentence by
+                sentence instead.
               </p>
             )}
             <div className="min-h-10 rounded-md border bg-muted/40 px-3 py-2 text-sm">

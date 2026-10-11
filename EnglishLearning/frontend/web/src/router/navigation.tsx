@@ -1,4 +1,4 @@
-import { Home, Play, FolderCog, type LucideIcon } from 'lucide-react';
+import { Home, Play, FolderCog, ScrollText, type LucideIcon } from 'lucide-react';
 
 export interface NavItem {
   label: string;
@@ -18,4 +18,5 @@ export const navItems: NavItem[] = [
   { label: 'Home', path: '/', icon: Home },
   { label: 'Player', path: '/player', icon: Play },
   { label: 'Manage', path: '/manage', icon: FolderCog },
+  { label: 'Logs', path: '/logs', icon: ScrollText },
 ];

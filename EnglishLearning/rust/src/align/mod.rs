@@ -28,6 +28,7 @@ pub mod safetensors;
 pub mod tensor;
 pub mod wav2vec2;
 
+use crate::logs;
 use crate::models::Word;
 use crate::pipeline::checkpoint;
 use crate::pipeline::transcribe::{BuildSink, BuildStage, CANCELLED};
@@ -284,6 +285,9 @@ pub fn refine_words(
                                 "sentence-video: {progress_msg}: reusing {} aligned word(s) from the checkpoint",
                                 cached.len()
                             );
+                            logs::debug("align", "alignment window reused from checkpoint")
+                                .detail(format!("{progress_msg} · {} word(s)", cached.len()))
+                                .send();
                             let _ = slots[i].set(cached);
                             break 'window;
                         }
@@ -297,18 +301,28 @@ pub fn refine_words(
                             "sentence-video: {progress_msg}: skipped, word timings span {:.1}s",
                             w.end - w.start
                         );
+                        logs::warn("align", "alignment window skipped")
+                            .detail(format!(
+                                "{progress_msg} · word timings span {:.1}s",
+                                w.end - w.start
+                            ))
+                            .send();
                         break 'window;
                     }
                     let a = ((w.start * rate) as usize).min(samples.len());
                     let b = ((w.end * rate) as usize).min(samples.len());
                     if b <= a {
                         eprintln!("sentence-video: {progress_msg}: skipped, no audio");
+                        logs::warn("align", "alignment window skipped")
+                            .detail(format!("{progress_msg} · no audio"))
+                            .send();
                         break 'window;
                     }
                     let texts: Vec<&str> = words[w.first..=w.last]
                         .iter()
                         .map(|x| x.text.as_str())
                         .collect();
+                    let started = std::time::Instant::now();
                     match aligner.align(&samples[a..b], &texts) {
                         Ok(mut refined) => {
                             // Times come back relative to the window.
@@ -331,11 +345,21 @@ pub fn refine_words(
                                 "sentence-video: {progress_msg}: aligned {} word(s)",
                                 refined.len()
                             );
+                            logs::debug("align", "alignment window finished")
+                                .detail(format!("{progress_msg} · {} word(s)", refined.len()))
+                                .duration_ms(started.elapsed().as_millis() as i64)
+                                .send();
                             let _ = slots[i].set(refined);
                         }
-                        Err(e) => eprintln!(
-                            "sentence-video: {progress_msg}: alignment failed: {e} (keeping whisper timings)"
-                        ),
+                        Err(e) => {
+                            eprintln!(
+                                "sentence-video: {progress_msg}: alignment failed: {e} (keeping whisper timings)"
+                            );
+                            logs::warn("align", "alignment window failed")
+                                .detail(format!("{progress_msg} · {e}"))
+                                .duration_ms(started.elapsed().as_millis() as i64)
+                                .send();
+                        }
                     }
                 }
 
