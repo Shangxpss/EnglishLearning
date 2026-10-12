@@ -1741,6 +1741,112 @@ impl AppState {
         )
     }
 
+    /// `POST /api/session/{id}/align` — re-run wav2vec2 forced alignment for a
+    /// session built without it, and replace the session with the refined
+    /// timings.
+    ///
+    /// This deliberately bypasses the cue-source order [`Self::build_session`]
+    /// uses: that one prefers an existing `<stem>_full_sentence.srt`, so a
+    /// session whose timings still need aligning would be "rebuilt" by parsing
+    /// that very file back — the aligner never runs. Going straight through
+    /// [`transcribe::transcribe_and_save`] keeps the transcript path, and with
+    /// the checkpoint directory the raw whisper words are read back instead of
+    /// re-transcribed, so only the alignment windows that are still missing
+    /// cost CPU. That is what makes an interrupted alignment resumable.
+    ///
+    /// Refused when the checkpoint holds no transcript: there would be nothing
+    /// to resume, and re-transcribing could silently replace cues that came from
+    /// a hand-made subtitle with a fresh ASR transcript.
+    ///
+    /// Synchronous, like a build — alignment is minutes, so the caller polls
+    /// `GET /api/builds` for the window counter while the request is in flight.
+    fn route_align(&self, session: &Session, req: &Request) -> Response {
+        if req.method != "POST" {
+            return Response::not_found();
+        }
+        let Some(dir) = self.work_dir(&session.media_path) else {
+            return Response::error(409, "this media file is gone — re-add it to align it");
+        };
+        if !dir.join("words.json").is_file() {
+            return Response::error(
+                409,
+                "no cached transcript to align — re-add the video with \"Align timings\" checked",
+            );
+        }
+        let work = match checkpoint::RecipeDir::open(dir, &asr_recipe()) {
+            Ok(work) => work,
+            Err(e) => return Response::error(500, &e),
+        };
+
+        let sink = self.begin_build(&session.media_path);
+        let aligned = transcribe::transcribe_and_save(
+            &session.media_path,
+            true,
+            Some(work.dir()),
+            Some(&sink),
+        );
+        self.end_build(&session.media_path);
+        let (cues, saved) = match aligned {
+            Ok(done) => done,
+            // Stopping is not a failure: the windows already aligned stay on
+            // disk, so pressing the button again continues from there.
+            Err(e) if e == transcribe::CANCELLED => {
+                logs::warn("build", "alignment cancelled")
+                    .media(&session.media_path)
+                    .session(&session.id)
+                    .send();
+                return Response::error(409, &e);
+            }
+            Err(e) => {
+                logs::error("build", "alignment failed")
+                    .media(&session.media_path)
+                    .session(&session.id)
+                    .detail(&e)
+                    .send();
+                return Response::error(422, &format!("alignment failed: {e}"));
+            }
+        };
+
+        // Re-key with the subtitle that was actually written, exactly as
+        // [`Self::build_session`] does — the new timings live in that file.
+        let key = SourceKey {
+            media_path: session.media_path.clone(),
+            media_mtime: file_mtime(&session.media_path),
+            subtitle_path: saved.clone(),
+            subtitle_mtime: saved.as_deref().and_then(file_mtime),
+        };
+        // The same id on purpose: this is a re-timing of the same video, so
+        // player links and saved sessions must keep working. `insert_session` is
+        // idempotent for an existing id — it replaces the row and its cues.
+        let refreshed = Session {
+            id: session.id.clone(),
+            media_path: session.media_path.clone(),
+            media_duration: session.media_duration,
+            source_format: "asr".to_string(),
+            cues,
+        };
+        if let Err(e) = self.db.insert_session(&refreshed, &key) {
+            return Response::error(500, &format!("cannot persist the aligned session: {e}"));
+        }
+        logs::info("build", "session re-aligned")
+            .media(&refreshed.media_path)
+            .session(&refreshed.id)
+            .detail(format!("{} cue(s) · source=asr", refreshed.cues.len()))
+            .send();
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(refreshed.id.clone(), refreshed.clone());
+        let body = serde_json::json!({
+            "session_id": refreshed.id,
+            "cues": refreshed.cues.len(),
+        });
+        bytes_ok(
+            body.to_string().as_bytes(),
+            "application/json; charset=utf-8",
+        )
+    }
+
     /// `POST /api/session/{id}/mux` — write this session's video out with the
     /// replacement voice track as its audio, into `data_dir/muxed/`.
     ///
@@ -1885,6 +1991,9 @@ impl AppState {
                 bytes_ok(&body, "application/json; charset=utf-8")
             }
             Some("dub") => self.route_dub(&session, req),
+            // Re-run forced alignment for a session that was built without it
+            // (or whose alignment was interrupted).
+            Some("align") => self.route_align(&session, req),
             Some("retranscode") => self.route_retranscode(&session, req),
             Some("mux") => self.route_mux(&session, req),
             // The muxed video (video + replacement voice track), range-streamed

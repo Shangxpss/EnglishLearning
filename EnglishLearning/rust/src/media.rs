@@ -8,6 +8,7 @@
 //!   * `write_wav`        — persist decoded samples as a RIFF/WAV file.
 //!   * `decode_segment_wav`— decode a [start,end] slice of a file to a WAV.
 //!   * `mux_video_audio`  — remux a video stream + (AAC-encoded) audio → .mp4.
+//!   * `write_m4a`        — encode decoded samples to AAC → .m4a (audio only).
 
 use ffmpeg_next::error::EAGAIN;
 use ffmpeg_next::format::flag::Flags as OutputFlags;
@@ -413,6 +414,85 @@ pub fn mux_video_audio(
         encoded.rescale_ts((1, sr as i32), aout_time_base);
         encoded.write_interleaved(&mut octx).map_err(ff_err)?;
     }
+
+    octx.write_trailer().map_err(ff_err)?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// write_m4a — audio-only counterpart of mux_video_audio
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Encode mono f32 samples to AAC in an `.m4a` container.
+///
+/// The audio-only sibling of [`mux_video_audio`] — same encoder, no video stream
+/// copied — which is what makes the audio round trip cheap over git: 16 kHz mono
+/// AAC is roughly 0.5 MB per minute, where the same audio as WAV is 2 MB, so a
+/// 52-minute video is ~19 MB instead of ~100 MB (the GitHub single-file limit).
+pub fn write_m4a(path: &str, interleaved: &[f32], sample_rate: u32, bit_rate: usize) -> Result<()> {
+    init()?;
+
+    let mut octx = ff_output(path).map_err(ff_err)?;
+    let global = octx.format().flags().contains(OutputFlags::GLOBAL_HEADER);
+
+    let aac = encoder::find(codec::Id::AAC).ok_or_else(|| media_err("AAC encoder not found"))?;
+    let mut aout = octx.add_stream(aac).map_err(ff_err)?;
+    let actx = codec::Context::from_parameters(aout.parameters()).map_err(ff_err)?;
+    let mut aenc = actx.encoder().audio().map_err(ff_err)?;
+    if global {
+        aenc.set_flags(ffmpeg_next::codec::flag::Flags::GLOBAL_HEADER);
+    }
+    aenc.set_rate(sample_rate as i32);
+    aenc.set_channel_layout(ChannelLayout::MONO);
+    aenc.set_channels(1);
+    aenc.set_format(Sample::F32(SampleType::Planar));
+    aenc.set_bit_rate(bit_rate);
+    aenc.set_time_base((1, sample_rate as i32));
+    aout.set_time_base((1, sample_rate as i32));
+    let aout_index = aout.index();
+
+    let mut aenc = aenc.open_as(aac).map_err(ff_err)?;
+    aout.set_parameters(&aenc);
+
+    octx.write_header().map_err(ff_err)?;
+
+    let aout_time_base = octx.stream(aout_index).map(|s| s.time_base()).unwrap();
+
+    let frame_size = aenc.frame_size().max(1) as usize;
+    let drain =
+        |aenc: &mut codec::encoder::Audio, octx: &mut format::context::Output| -> Result<()> {
+            let mut encoded = packet::Packet::empty();
+            while aenc.receive_packet(&mut encoded).is_ok() {
+                encoded.set_stream(aout_index);
+                encoded.rescale_ts((1, sample_rate as i32), aout_time_base);
+                encoded.write_interleaved(octx).map_err(ff_err)?;
+            }
+            Ok(())
+        };
+
+    for frame_index in 0..interleaved.len().div_ceil(frame_size) {
+        let start = frame_index * frame_size;
+        let end = (start + frame_size).min(interleaved.len());
+        // The encoder needs whole frames, so the tail is zero-padded — a few ms
+        // of silence at the very end, not a timing shift.
+        let mut chunk = interleaved[start..end].to_vec();
+        chunk.resize(frame_size, 0.0f32);
+
+        let mut af = frame::Audio::new(
+            Sample::F32(SampleType::Planar),
+            frame_size,
+            ChannelLayout::MONO,
+        );
+        af.set_rate(sample_rate);
+        af.set_channel_layout(ChannelLayout::MONO);
+        af.set_pts(Some((frame_index * frame_size) as i64));
+        af.plane_mut::<f32>(0).copy_from_slice(&chunk);
+        aenc.send_frame(&af).map_err(ff_err)?;
+        drain(&mut aenc, &mut octx)?;
+    }
+
+    aenc.send_eof().map_err(ff_err)?;
+    drain(&mut aenc, &mut octx)?;
 
     octx.write_trailer().map_err(ff_err)?;
     Ok(())

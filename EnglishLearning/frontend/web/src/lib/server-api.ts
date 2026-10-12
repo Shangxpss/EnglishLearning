@@ -260,6 +260,26 @@ export async function retranscode(sessionId: string): Promise<void> {
 }
 
 /**
+ * `POST /api/session/{id}/align` — re-run wav2vec2 forced alignment for this
+ * session and replace it with the refined word timings.
+ *
+ * Synchronous and minutes long, like adding a video: the alignment windows
+ * already computed are reused, so this resumes an interrupted run instead of
+ * restarting it, and the server registers it as a build — poll `/api/builds`
+ * for the window counter while the call is in flight. A 409 means there is no
+ * cached transcript to resume from.
+ */
+export async function alignSession(sessionId: string): Promise<void> {
+  const resp = await fetch(
+    `/api/session/${encodeURIComponent(sessionId)}/align`,
+    {
+      method: "POST",
+    },
+  );
+  if (!resp.ok) throw new Error(await readError(resp));
+}
+
+/**
  * `POST /api/session/{id}/mux` — write the video out with the replacement voice
  * track as its audio, into the server's `muxed/` folder, and return where it
  * landed.
@@ -440,3 +460,4 @@ export async function clearLogs(): Promise<number> {
   const data: { cleared: number } = await resp.json();
   return data.cleared ?? 0;
 }
+

@@ -44,6 +44,8 @@ fn print_usage() {
          USAGE:\n\
          \x20 sentence-video [serve] <media-file> [OPTIONS]\n\
          \x20 sentence-video replace-audio <video> <audio> <output> [--bitrate <bps>] [--full]\n\
+         \x20 sentence-video extract-audio <media> [--out <dir>] [OPTIONS]\n\
+         \x20 sentence-video dub-audio <audio> [--out <dir>] [OPTIONS]\n\
          \x20 sentence-video dub <video> <output> [--subtitle <srt>|<vtt>] [OPTIONS]\n\
          \x20 sentence-video agent [--host <addr>] [--port <n>] [OPTIONS]\n\
          \x20 sentence-video align <media> [--transcript <text|file>] [OPTIONS]\n\n\
@@ -81,7 +83,13 @@ fn print_usage() {
          \x20   <audio>    new audio track (mp3/wav/m4a/…)\n\
          \x20   <output>   output path (e.g. out.mp4); video copied, audio → AAC\n\
          \x20   --bitrate  AAC bitrate in bits/sec (default 128000)\n\
-         \x20   --full     keep audio at full length (default trims to video)\n\n\
+         \x20   --full     keep audio at full length (default trims to video)\n\
+         AUDIO ROUND TRIP (process the small audio instead of the huge video —\n\
+         \x20 only the .m4a (~0.5 MB/min at 16 kHz mono AAC) and the .srt go\n\
+         \x20 through git, never the video):\n\
+         \x20 1. extract-audio <video> --out video/audio/origin   (here)\n\
+         \x20 2. dub-audio     <audio> --out video/audio/processed (on the remote)\n\
+         \x20 3. replace-audio <video> <track> <output>           (here, merges it back)\n\
          DUB (modular pipeline: cues → generated audio → replace):\n\
          \x20   <video>        source media to dub\n\
          \x20   --subtitle     cues source (default: auto-detect <video>.srt/.vtt)\n\
@@ -185,6 +193,138 @@ fn run_replace_audio(args: &[String]) {
         Ok(()) => println!("sentence-video: done → {output}"),
         Err(e) => {
             eprintln!("sentence-video: failed to replace audio: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// extract-audio subcommand — step 1 of the audio round trip
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Make sure the folder `path` will be written into exists.
+///
+/// `--out` names a *convention* folder (`video/audio/origin`), and on the machine
+/// that only ever pulls the audio, that folder exists only because git checked it
+/// out — so create it rather than failing on a path that is correct but new.
+fn ensure_parent(path: &str) -> std::io::Result<()> {
+    match std::path::Path::new(path).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::create_dir_all(dir),
+        _ => Ok(()),
+    }
+}
+
+/// `<dir>/<file stem><ext>` — the sibling of `src` renamed to `ext`, or inside
+/// `out_dir` when one was given.
+///
+/// Both audio round-trip steps name their output after the input stem, because
+/// the same convention is what lets the *other* machine find the file: the local
+/// side commits `audio/origin/<stem>.m4a` and the remote side only has to look
+/// for `<stem>` in the folder it was told to write to.
+fn named_sibling(src: &str, out_dir: Option<&str>, ext: &str) -> String {
+    use std::path::{Path, PathBuf};
+
+    let path = Path::new(src);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".to_string());
+    let dir = match out_dir {
+        Some(d) => PathBuf::from(d),
+        None => path.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    dir.join(format!("{stem}{ext}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `sentence-video extract-audio <media> [--out <dir>] [--bitrate <bps>]
+///                     [--sample-rate <hz>]`
+///
+/// Step 1 of the audio round trip: pull the audio out of a video so only that —
+/// far smaller — file has to travel through git. The samples are resampled to
+/// mono at `--sample-rate` (16 kHz by default, which is what speech-to-text and
+/// the aligner consume anyway) and AAC-encoded into an `.m4a`.
+///
+/// The timeline is left exactly as it was: no lead-in, no trimming to a keyframe.
+/// That is the whole reason this works as a round trip — the processed track that
+/// comes back is mixed into the video at the same timestamps it was taken from.
+fn run_extract_audio(args: &[String]) {
+    let mut media: Option<String> = None;
+    let mut out_dir: Option<String> = None;
+    // 48 kbps mono is transparent enough for speech and puts a 52-minute talk at
+    // ~19 MB, comfortably under the 100 MB GitHub single-file ceiling that the
+    // source video (143 MB) is well over.
+    let mut bitrate = 48_000usize;
+    let mut sample_rate = 16_000u32;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                out_dir = args.get(i).cloned();
+            }
+            "--bitrate" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    bitrate = v.parse().unwrap_or(bitrate);
+                }
+            }
+            "--sample-rate" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    sample_rate = v.parse().unwrap_or(sample_rate);
+                }
+            }
+            other => {
+                if media.is_none() && !other.starts_with('-') {
+                    media = Some(other.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let Some(media) = media else {
+        eprintln!(
+            "sentence-video: extract-audio requires a media file\n\n\
+             sentence-video extract-audio <media> [--out <dir>] [--bitrate <bps>]\n\
+             \x20                  [--sample-rate <hz>]\n\n\
+             \x20 <media>        video (or audio) to pull the audio out of\n\
+             \x20 --out <dir>     folder for <name>.m4a (default: beside <media>)\n\
+             \x20 --bitrate       AAC bitrate in bits/sec (default 48000)\n\
+             \x20 --sample-rate   resample to this rate, mono (default 16000)"
+        );
+        std::process::exit(1);
+    };
+
+    let media = media::normalize_path(&media);
+    let output = media::normalize_path(&named_sibling(&media, out_dir.as_deref(), ".m4a"));
+    if let Err(e) = ensure_parent(&output) {
+        eprintln!("sentence-video: cannot create the folder for '{output}': {e}");
+        std::process::exit(1);
+    }
+
+    let (samples, _channels) = match media::decode_to_f32(&media, sample_rate, true, None) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sentence-video: cannot decode '{media}': {e}");
+            std::process::exit(1);
+        }
+    };
+    if samples.is_empty() {
+        eprintln!("sentence-video: '{media}' has no audio to extract");
+        std::process::exit(1);
+    }
+    println!(
+        "sentence-video: extracting {:.1}s of audio from '{media}' → '{output}'",
+        samples.len() as f64 / sample_rate as f64
+    );
+    match media::write_m4a(&output, &samples, sample_rate, bitrate) {
+        Ok(()) => println!("sentence-video: done → {output}"),
+        Err(e) => {
+            eprintln!("sentence-video: failed to write the audio: {e}");
             std::process::exit(1);
         }
     }
@@ -310,6 +450,224 @@ fn run_dub(args: &[String]) {
         Ok(None) => println!("sentence-video: done → {output}"),
         Err(e) => {
             eprintln!("sentence-video: dub failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// dub-audio subcommand — step 2 of the audio round trip (the remote machine)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `sentence-video dub-audio <audio> [--out <dir>] [--subtitle <srt|vtt>]
+///                   [--align] [--engine <name>] [--voice <name>]
+///                   [--asr-model <path>] [--asr-language <code>]
+///                   [--bitrate <bps>] [--sample-rate <hz>] [--keep-wav]`
+///
+/// Step 2 of the audio round trip, made for the machine that does the heavy
+/// work. It takes the extracted audio *alone* — no video, no server, no browser —
+/// and writes the two artifacts to commit back:
+///
+///   * `<name>.srt` — the cues, so the timings stay inspectable and editable;
+///   * `<name>.m4a` — the replacement voice track, as long as the input and on
+///     the same timeline, i.e. exactly what `replace-audio` mixes into the video
+///     on the other side.
+///
+/// Cues come from the audio itself: an adjacent `<name>.srt` is used when one is
+/// there, otherwise whisper transcribes it. `--align` additionally refines the
+/// word timings with wav2vec2, which needs its weights on this machine.
+fn run_dub_audio(args: &[String]) {
+    let mut audio: Option<String> = None;
+    let mut out_dir: Option<String> = None;
+    let mut subtitle: Option<String> = None;
+    let mut engine: Option<String> = None;
+    let mut voice: Option<String> = None;
+    let mut asr_model: Option<std::path::PathBuf> = None;
+    let mut asr_language: Option<String> = None;
+    let mut align = false;
+    let mut keep_wav = false;
+    let mut bitrate = 48_000usize;
+    let mut sample_rate = 16_000u32;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                out_dir = args.get(i).cloned();
+            }
+            "--subtitle" => {
+                i += 1;
+                subtitle = args.get(i).cloned();
+            }
+            "--align" => align = true,
+            "--engine" => {
+                i += 1;
+                engine = args.get(i).cloned();
+            }
+            "--voice" => {
+                i += 1;
+                voice = args.get(i).cloned();
+            }
+            "--asr-model" => {
+                i += 1;
+                if let Some(p) = args.get(i) {
+                    asr_model = Some(std::path::PathBuf::from(media::normalize_path(p)));
+                }
+            }
+            "--asr-language" => {
+                i += 1;
+                asr_language = args.get(i).cloned();
+            }
+            "--keep-wav" => keep_wav = true,
+            "--bitrate" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    bitrate = v.parse().unwrap_or(bitrate);
+                }
+            }
+            "--sample-rate" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    sample_rate = v.parse().unwrap_or(sample_rate);
+                }
+            }
+            other => {
+                if audio.is_none() && !other.starts_with('-') {
+                    audio = Some(other.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let Some(audio) = audio else {
+        eprintln!(
+            "sentence-video: dub-audio requires an audio file\n\n\
+             sentence-video dub-audio <audio> [--out <dir>] [--subtitle <srt|vtt>]\n\
+             \x20                  [--align] [--engine <name>] [--voice <name>]\n\
+             \x20                  [--asr-model <path>] [--asr-language <code>]\n\
+             \x20                  [--bitrate <bps>] [--sample-rate <hz>] [--keep-wav]\n\n\
+             \x20 <audio>         extracted audio (m4a/wav/mp3/…) — no video needed\n\
+             \x20 --out <dir>     folder for <name>.m4a and <name>.srt\n\
+             \x20                 (default: beside <audio>)\n\
+             \x20 --subtitle     cues source; default: an adjacent <name>.srt,\n\
+             \x20                 otherwise transcribe the audio\n\
+             \x20 --align        refine the timings with wav2vec2 forced alignment\n\
+             \x20 --engine       TTS backend: edge-tts (default) | espeak-ng | silence\n\
+             \x20 --voice        voice for that backend (default: the backend's own)\n\
+             \x20 --bitrate      AAC bitrate in bits/sec (default 48000)\n\
+             \x20 --sample-rate  rate of the written track, mono (default 16000)\n\
+             \x20 --keep-wav     keep the generated intermediate WAV"
+        );
+        std::process::exit(1);
+    };
+
+    let audio = media::normalize_path(&audio);
+    let subtitle = subtitle.map(|s| media::normalize_path(&s));
+    let m4a_out = media::normalize_path(&named_sibling(&audio, out_dir.as_deref(), ".m4a"));
+    let srt_out = media::normalize_path(&named_sibling(&audio, out_dir.as_deref(), ".srt"));
+    if let Err(e) = ensure_parent(&m4a_out) {
+        eprintln!("sentence-video: cannot create the folder for '{m4a_out}': {e}");
+        std::process::exit(1);
+    }
+
+    // Speech-to-text: the model may be embedded in the binary or given with
+    // `--asr-model`. Say so up front — on a remote build it is the one thing
+    // most likely to be missing, and a subtitle avoids the need for it entirely.
+    asr::init(asr_model, asr_language, align);
+    if !asr::model_available(asr::config().model.as_deref()) {
+        eprintln!(
+            "sentence-video: speech-to-text unavailable: {}",
+            asr::NO_MODEL_HELP
+        );
+        eprintln!("sentence-video: continuing only if a subtitle supplies the cues.");
+    }
+
+    let duration = match media::probe_duration(&audio) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("sentence-video: cannot read '{audio}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!(
+        "sentence-video: dubbing {:.1}s of audio in '{audio}' → '{m4a_out}'",
+        duration
+    );
+    let cues = match pipeline::transcribe::cues_from_media(&audio, subtitle.as_deref(), align) {
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => {
+            eprintln!("sentence-video: no cues found in '{audio}' — nothing to synthesize");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("sentence-video: cannot determine the cues: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("sentence-video: {} sentence(s)", cues.len());
+    if let Err(e) = subtitle::write_srt(&cues, &srt_out) {
+        eprintln!("sentence-video: cannot write '{srt_out}': {e}");
+        std::process::exit(1);
+    }
+    println!("sentence-video: timings → {srt_out}");
+
+    // Flags win, then the environment, then the built-in default — the same
+    // order the server uses, so a remote run behaves like the local UI.
+    let dub_defaults = pipeline::DubConfig::default();
+    let engine = engine
+        .or_else(|| env_setting("SENTENCE_VIDEO_DUB_ENGINE"))
+        .unwrap_or(dub_defaults.engine);
+    let voice = voice.or_else(|| env_setting("SENTENCE_VIDEO_DUB_VOICE"));
+    let proxy = env_setting("SENTENCE_VIDEO_DUB_PROXY");
+    let backend = match pipeline::synthesize::build_backend(
+        &engine,
+        voice.as_deref(),
+        dub_defaults.rate_words_per_min,
+        proxy.as_deref(),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("sentence-video: cannot start the TTS engine '{engine}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // The synthesized track is written as a WAV first (that is what the stitcher
+    // produces), then re-read at the small, git-friendly rate and encoded to AAC.
+    let tmp_wav = std::env::temp_dir()
+        .join(format!(
+            "sentence-video-dub-audio-{}.wav",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned();
+    if let Err(e) = pipeline::synthesize::synthesize_track(&*backend, &cues, duration, &tmp_wav) {
+        eprintln!("sentence-video: synthesis failed: {e}");
+        let _ = std::fs::remove_file(&tmp_wav);
+        std::process::exit(1);
+    }
+
+    let (samples, _channels) = match media::decode_to_f32(&tmp_wav, sample_rate, true, None) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sentence-video: cannot read the generated track: {e}");
+            let _ = std::fs::remove_file(&tmp_wav);
+            std::process::exit(1);
+        }
+    };
+    let encoded = media::write_m4a(&m4a_out, &samples, sample_rate, bitrate);
+    if keep_wav {
+        println!("sentence-video: kept generated audio → {tmp_wav}");
+    } else {
+        let _ = std::fs::remove_file(&tmp_wav);
+    }
+    match encoded {
+        Ok(()) => println!("sentence-video: done → {m4a_out}"),
+        Err(e) => {
+            eprintln!("sentence-video: failed to write the track: {e}");
             std::process::exit(1);
         }
     }
@@ -628,6 +986,19 @@ fn main() {
     if args.first().map(String::as_str) == Some("replace-audio") {
         args.remove(0);
         run_replace_audio(&args);
+        return;
+    }
+    // The audio round trip: pull the audio out here, dub it on the machine that
+    // holds the models, then mix the result back here. Batch operations too, so
+    // they never start a server.
+    if args.first().map(String::as_str) == Some("extract-audio") {
+        args.remove(0);
+        run_extract_audio(&args);
+        return;
+    }
+    if args.first().map(String::as_str) == Some("dub-audio") {
+        args.remove(0);
+        run_dub_audio(&args);
         return;
     }
     if args.first().map(String::as_str) == Some("dub") {

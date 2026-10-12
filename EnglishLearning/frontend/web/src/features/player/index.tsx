@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import {
-  pickFileOnServer,
   readError,
   type DubbingState,
   type SessionSummary,
@@ -14,7 +13,6 @@ import {
  * the Rust binary actually implements:
  *
  *   GET  /api/sessions                             → session summaries
- *   POST /api/session                              { media_path, subtitle_path?, align?, dub?, dub_engine? }
  *   GET  /api/session/{id}                         → { id, media_path, media_duration, cues[], dubbed, video }
  *   GET  /api/session/{id}/cues                    → sentence list
  *   GET  /api/session/{id}/media                   → Range-streamed source media
@@ -121,16 +119,7 @@ export function PlayerPage() {
   const [loopMode, setLoopMode] = useState(false);
   const [playThrough, setPlayThrough] = useState(false);
   const [filter, setFilter] = useState('');
-  const [mediaPath, setMediaPath] = useState('');
-  const [subtitlePath, setSubtitlePath] = useState('');
-  /** Refine the word timings with wav2vec2 forced alignment (`align` in the POST body). */
-  const [align, setAlign] = useState(false);
-  /** Replace the voice with TTS synthesis (`dub` / `dub_engine` in the POST body). */
-  const [dub, setDub] = useState(false);
-  const [dubEngine, setDubEngine] = useState('edge-tts');
   const [loading, setLoading] = useState(true);
-  const [creating, setCreating] = useState(false);
-  const [picking, setPicking] = useState<'media' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [manageOpen, setManageOpen] = useState(false);
   /** Session id being deleted, or '*' while deleting everything. */
@@ -451,68 +440,6 @@ export function PlayerPage() {
     return () => window.clearInterval(timer);
   }, [playIndex, playClip, stopClip]);
 
-  const createSession = useCallback(
-    async (overrideMedia?: string, overrideSubtitle?: string) => {
-      const media = (overrideMedia ?? mediaPath).trim();
-      const subtitle = (overrideSubtitle ?? subtitlePath).trim();
-      if (!media) {
-        setError('Choose a video or enter a media path first.');
-        return;
-      }
-      setCreating(true);
-      setError(null);
-      try {
-        const body: Record<string, string | boolean> = { media_path: media };
-        if (subtitle) body.subtitle_path = subtitle;
-        // Only ever opts IN: leaving the box unchecked keeps whatever the server
-        // was started with (`--align` / `SENTENCE_VIDEO_ALIGN=1`).
-        if (align) body.align = true;
-        // Same for dubbing: the server synthesises a replacement voice track
-        // and the player uses it instead of the video's own audio.
-        if (dub) {
-          body.dub = true;
-          body.dub_engine = dubEngine;
-        }
-        const resp = await fetch('/api/session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        if (!resp.ok) throw new Error(await readError(resp));
-        const data: { session_id: string } = await resp.json();
-        setMediaPath('');
-        setSubtitlePath('');
-        await refreshSessions(false);
-        await loadSession(data.session_id);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        setCreating(false);
-      }
-    },
-    [mediaPath, subtitlePath, align, dub, dubEngine, refreshSessions, loadSession]
-  );
-
-  /**
-   * Pick a video through the server's native dialog and process it right
-   * away: the returned path is one the Rust server can actually read, so it
-   * is sent straight to `POST /api/session`.
-   */
-  const chooseVideo = useCallback(async () => {
-    setError(null);
-    setPicking('media');
-    try {
-      const path = await pickFileOnServer('media');
-      if (!path) return; // cancelled
-      setMediaPath(path);
-      await createSession(path, subtitlePath);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setPicking(null);
-    }
-  }, [createSession, subtitlePath]);
-
   // Auto-scroll the active sentence into view.
   useEffect(() => {
     if (activeIdx < 0 || !listRef.current) return;
@@ -608,123 +535,6 @@ export function PlayerPage() {
           {error}
         </div>
       )}
-
-      <div className="space-y-3 rounded-lg border bg-card p-4">
-        <h2 className="text-sm font-semibold">Open a session</h2>
-        <div className="flex flex-wrap gap-2">
-          <button
-            onClick={() => void chooseVideo()}
-            disabled={picking !== null || creating}
-            className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity disabled:opacity-50"
-          >
-            {picking === 'media' ? 'Waiting for the file dialog…' : '📂 Choose video…'}
-          </button>
-          <label
-            title="Refine the word timings with wav2vec2 forced alignment. Only applies when the audio is transcribed — an existing <name>_full_sentence.srt is used as-is."
-            className="flex cursor-pointer items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted has-disabled:opacity-50"
-          >
-            <input
-              type="checkbox"
-              checked={align}
-              onChange={(e) => setAlign(e.target.checked)}
-              disabled={creating || picking !== null}
-              className="h-4 w-4 accent-primary"
-            />
-            Align timings
-          </label>
-          <label
-            title="Synthesise a replacement voice track for this video and play it instead of the original audio. One TTS call per sentence, placed at the sentence's start time and re-synthesised at a faster rate only when it would overlap the next sentence."
-            className="flex cursor-pointer items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted has-disabled:opacity-50"
-          >
-            <input
-              type="checkbox"
-              checked={dub}
-              onChange={(e) => setDub(e.target.checked)}
-              disabled={creating || picking !== null}
-              className="h-4 w-4 accent-primary"
-            />
-            Dub audio
-          </label>
-          <select
-            value={dubEngine}
-            onChange={(e) => setDubEngine(e.target.value)}
-            disabled={!dub || creating || picking !== null}
-            title="Which TTS engine synthesises the replacement voice."
-            className="rounded-md border bg-background px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
-          >
-            <option value="edge-tts">edge-tts (neural, en-GB Maisie)</option>
-            <option value="espeak-ng">espeak-ng (offline)</option>
-          </select>
-          <button
-            onClick={() => void createSession()}
-            disabled={creating || !mediaPath.trim()}
-            className="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50"
-          >
-            {creating ? 'Creating…' : 'Use entered path'}
-          </button>
-        </div>
-        <div className="flex flex-col gap-2 lg:flex-row">
-          <input
-            value={mediaPath}
-            onChange={(e) => setMediaPath(e.target.value)}
-            placeholder="/absolute/path/to/video.mp4"
-            className="flex-1 rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            disabled={creating || picking !== null}
-          />
-          <input
-            value={subtitlePath}
-            onChange={(e) => setSubtitlePath(e.target.value)}
-            placeholder="optional subtitle .srt/.vtt"
-            className="flex-1 rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            disabled={creating || picking !== null}
-          />
-        </div>
-        <p className="text-xs text-muted-foreground">
-          “Choose video…” opens a file dialog on the machine running the Rust server and
-          immediately processes the file it returns. It looks for{' '}
-          <code className="font-mono">&lt;name&gt;_full_sentence.srt</code> next to the video:
-          if that exists it is used as-is, otherwise the audio is transcribed by the built-in
-          speech-to-text model and saved to that file (no internet needed). You can also type
-          an absolute path manually. Tick <strong>Align timings</strong> to refine that
-          transcription's word timings with wav2vec2 forced alignment — it only applies when
-          the audio is transcribed (an existing <code className="font-mono">_full_sentence.srt</code>{' '}
-          is used as-is) and only in a server built with the <code className="font-mono">asr-align</code> feature.
-          Tick <strong>Dub audio</strong> to also synthesise a replacement voice track and play it
-          instead of the original audio (the video is muted). The engine is chosen beside the box:
-          <code className="font-mono">edge-tts</code> (the default) uses the English
-          (United Kingdom) <strong>Maisie</strong> neural voice and needs to be installed and
-          online; <code className="font-mono">espeak-ng</code> works offline. Dubbing keeps
-          each sentence at its original start time and only speeds a sentence up when it would
-          otherwise run into the next one.
-        </p>
-
-        {loading ? (
-          <p className="text-sm text-muted-foreground">Loading sessions…</p>
-        ) : sessions.length > 0 ? (
-          <div className="flex flex-wrap gap-2">
-            {sessions.map((s) => (
-              <button
-                key={s.session_id}
-                onClick={() => void loadSession(s.session_id)}
-                className={cn(
-                  'rounded-full border px-3 py-1 text-xs transition-colors',
-                  session?.id === s.session_id
-                    ? 'border-primary bg-primary/10 font-medium'
-                    : 'hover:bg-muted'
-                )}
-              >
-                {basename(s.media_path)} · {s.cue_count} cues
-                {s.last_index >= 0 ? ` · resume #${s.last_index + 1}` : ''}
-              </button>
-            ))}
-          </div>
-        ) : (
-          <p className="text-sm text-muted-foreground">
-            No saved sessions yet. Choose a video above — it is stored in the local SQLite
-            database and reopened (at your last sentence) next time.
-          </p>
-        )}
-      </div>
 
       {session && (
         <div className="grid gap-6 lg:grid-cols-2">
@@ -890,10 +700,11 @@ export function PlayerPage() {
           >
             <div className="flex items-start justify-between gap-4 border-b px-5 py-3">
               <div>
-                <h2 className="text-lg font-semibold">Stored sessions</h2>
+                <h2 className="text-lg font-semibold">Sessions</h2>
                 <p className="text-xs text-muted-foreground">
-                  Saved in the local SQLite database. Deleting removes the record, its cues
-                  and its resume point.
+                  Pick a video to open it in the player. Saved in the local SQLite database;
+                  deleting also removes its cues and its resume point. Add or re-process
+                  videos on the <strong>Manage</strong> page.
                 </p>
               </div>
               <button
@@ -906,39 +717,55 @@ export function PlayerPage() {
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
-              {sessions.length === 0 ? (
+              {loading ? (
                 <p className="py-8 text-center text-sm text-muted-foreground">
-                  No stored sessions.
+                  Loading sessions…
+                </p>
+              ) : sessions.length === 0 ? (
+                <p className="py-8 text-center text-sm text-muted-foreground">
+                  No stored sessions yet. Add a video on the <strong>Manage</strong> page.
                 </p>
               ) : (
                 <ul className="space-y-2">
-                  {sessions.map((s) => (
-                    <li
-                      key={s.session_id}
-                      className="flex items-center gap-3 rounded-lg border p-3"
-                    >
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-sm font-medium">
-                          {basename(s.media_path)}
-                        </div>
-                        <div className="truncate font-mono text-[11px] text-muted-foreground">
-                          {s.media_path}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {s.cue_count} cues · {s.media_duration.toFixed(1)}s
-                          {s.last_index >= 0 ? ` · resume #${s.last_index + 1}` : ''}
-                          {session?.id === s.session_id ? ' · open' : ''}
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => void deleteSession(s.session_id)}
-                        disabled={deleting !== null}
-                        className="shrink-0 rounded-md border border-destructive/40 px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                  {sessions.map((s) => {
+                    const open = session?.id === s.session_id;
+                    return (
+                      <li
+                        key={s.session_id}
+                        className={cn(
+                          'flex items-center gap-3 rounded-lg border p-3 transition-colors',
+                          open ? 'border-primary bg-primary/5' : 'hover:bg-muted'
+                        )}
                       >
-                        {deleting === s.session_id ? 'Deleting…' : 'Delete'}
-                      </button>
-                    </li>
-                  ))}
+                        <button
+                          onClick={() => {
+                            void loadSession(s.session_id);
+                            setManageOpen(false);
+                          }}
+                          className="min-w-0 flex-1 text-left"
+                        >
+                          <div className="truncate text-sm font-medium">
+                            {basename(s.media_path)}
+                            {open ? ' · open' : ''}
+                          </div>
+                          <div className="truncate font-mono text-[11px] text-muted-foreground">
+                            {s.media_path}
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            {s.cue_count} cues · {s.media_duration.toFixed(1)}s
+                            {s.last_index >= 0 ? ` · resume #${s.last_index + 1}` : ''}
+                          </div>
+                        </button>
+                        <button
+                          onClick={() => void deleteSession(s.session_id)}
+                          disabled={deleting !== null}
+                          className="shrink-0 rounded-md border border-destructive/40 px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                        >
+                          {deleting === s.session_id ? 'Deleting…' : 'Delete'}
+                        </button>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </div>

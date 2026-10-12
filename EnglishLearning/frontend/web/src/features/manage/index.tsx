@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router';
 import { cn } from '@/lib/utils';
 import {
+  alignSession,
   cancelBuild,
   createSession,
   deleteSession,
@@ -129,6 +130,8 @@ export function ManagePage() {
   const [busy, setBusy] = useState<string | null>(null);
   /** Media path of a build the user asked to stop, until it actually stops. */
   const [cancellingFor, setCancellingFor] = useState<string | null>(null);
+  /** Session whose alignment is being recomputed — minutes, so it is labelled. */
+  const [aligningFor, setAligningFor] = useState<string | null>(null);
 
   // Add-video options: the same choices the Player's "Open a session" box has.
   const [addMedia, setAddMedia] = useState('');
@@ -347,6 +350,32 @@ export function ManagePage() {
       setBusy(null);
     }
   }, []);
+
+  /**
+   * Recompute this session's word timings with wav2vec2 forced alignment.
+   *
+   * The POST blocks for minutes, like adding a video, so the row is left in the
+   * "Aligning…" state and the page's own polling shows the window counter in the
+   * Processing panel. Windows aligned by an earlier, interrupted run are reused,
+   * which is why this is the way to finish an alignment that was stopped.
+   */
+  const runAlign = useCallback(
+    async (sessionId: string) => {
+      setBusy(sessionId);
+      setAligningFor(sessionId);
+      setError(null);
+      try {
+        await alignSession(sessionId);
+        await refresh(false);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setAligningFor(null);
+        setBusy(null);
+      }
+    },
+    [refresh]
+  );
 
   /**
    * Export the short-cue `<stem>.srt` a video platform accepts, beside the
@@ -770,6 +799,18 @@ export function ManagePage() {
                             Open directory
                           </button>
                         )}
+                        <button
+                          onClick={() => void runAlign(row.session_id)}
+                          disabled={disabled}
+                          title={
+                            aligningFor === row.session_id
+                              ? 'Aligning window by window — the Processing panel above shows how far it has got. Stopping the server or cancelling keeps every window already aligned.'
+                              : 'Recompute the word timings with wav2vec2 forced alignment and replace this session with the refined ones. Windows aligned by an earlier run are reused, so this finishes an interrupted alignment instead of restarting it. Needs the cached transcript — a session built from a hand-made subtitle has none.'
+                          }
+                          className="rounded-md border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-muted disabled:opacity-50"
+                        >
+                          {aligningFor === row.session_id ? 'Aligning…' : 'Align'}
+                        </button>
                         <button
                           onClick={() => void runPlatformSubtitle(row.session_id)}
                           disabled={disabled || platformState === 'running'}

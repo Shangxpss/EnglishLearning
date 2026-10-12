@@ -86,3 +86,9 @@ target/
 # Legacy dubbing output dirs (still ignored)
 sync_dub/
 sync_dub_parallel/
+
+# Audio round-trip workspace (video/): only the small artifacts are tracked —
+# audio/origin/*.m4a, audio/processed/*.m4a and their .srt. The source videos
+# are 100+ MB, over GitHub's single-file limit, so they must never be committed.
+video/origin_video/
+video/muxed/
