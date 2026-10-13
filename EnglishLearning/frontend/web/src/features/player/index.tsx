@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
+import { useAgentContext } from '@copilotkit/react-core/v2';
 import { cn } from '@/lib/utils';
 import {
   readError,
@@ -166,6 +167,26 @@ export function PlayerPage() {
    */
   const useMuxed = dubbed && session?.muxed?.state === 'done';
   useMuxedRef.current = useMuxed;
+
+  /**
+   * The open video's transcript, handed to the floating assistant.
+   *
+   * An AG-UI run carries only the chat messages, so without this the agent has
+   * no idea what the user is watching. Formatted once per session: the model
+   * gets sentence indices and timestamps just as they appear in the cue list.
+   */
+  const transcript = useMemo(() => {
+    if (!session || cues.length === 0) return '';
+    const lines = cues.map(
+      (cue) => `[${cue.index}] ${fmtTime(cue.start)}-${fmtTime(cue.end)} ${cue.text}`
+    );
+    return `Video: ${basename(session.media_path)} (${cues.length} sentences)\n\n${lines.join('\n')}`;
+  }, [session, cues]);
+
+  // Registered under the label the Rust agent reads back
+  // (`agent::engine::prompt::VIDEO_TRANSCRIPT_CONTEXT`) via `RunContext::context`.
+  // Empty when no video is open, which leaves the agent without video context.
+  useAgentContext({ description: 'video_transcript', value: transcript });
 
   /** Silence the original audio while a really-dubbed sentence clip plays. */
   useEffect(() => {

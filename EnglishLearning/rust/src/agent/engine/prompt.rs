@@ -55,8 +55,35 @@ pub fn system_prompt(cfg: &AgentConfig) -> String {
 }
 
 /// The persona line, kept separate so it is easy to reword.
-const HEADER: &str = "You are a helpful AI assistant powered by DeepSeek. \
-You can check the weather, perform calculations, and display rich UI cards.";
+const HEADER: &str = "You are the EnglishPro assistant, embedded in a sentence-segmented \
+video player. When the user has a video open, its full transcript is supplied as ambient \
+context: answer questions about what the video says by quoting that transcript and its \
+timestamps. You can also check the weather, perform calculations, and display rich UI cards.";
+
+/// AG-UI ambient-context label under which the frontend publishes the video the
+/// user currently has open.
+///
+/// Must match `VIDEO_TRANSCRIPT_CONTEXT` in
+/// `frontend/web/src/features/player/index.tsx`: the player registers the
+/// transcript through `useAgentContext`, CopilotKit forwards it in the run's
+/// `context` array, and [`crate::agent::runtime`] picks it back out by this
+/// exact description.
+pub const VIDEO_TRANSCRIPT_CONTEXT: &str = "video_transcript";
+
+/// The instruction block that hands the model the transcript of the open video.
+///
+/// Without it the model only ever sees the chat text, so "what does he say
+/// about X?" would be unanswerable — the transcript is the whole point of
+/// chatting from the player page.
+pub fn video_transcript_prompt(transcript: &str) -> String {
+    format!(
+        "The user is watching a video. Its full transcript follows — one line per \
+         sentence, with the sentence index and start/end timestamps. Ground every \
+         answer about the video in this transcript, and quote the exact sentence and \
+         timestamp you are relying on.\n\n\
+         <video_transcript>\n{transcript}\n</video_transcript>"
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -72,10 +99,18 @@ mod tests {
 
     #[test]
     fn prompt_forbids_the_components_that_do_not_exist() {
-        let prompt = system_prompt(&AgentConfig::default());
+        let cfg = AgentConfig::default();
+        let prompt = system_prompt(&cfg);
         assert!(prompt.contains("NEVER use \"Title\" or \"Header\""));
         assert!(prompt.contains("render_a2ui"));
         // The sub-agent tool is gone, so it must not be advertised.
         assert!(!prompt.contains("generate_a2ui"));
+    }
+
+    #[test]
+    fn the_video_transcript_prompt_carries_the_transcript_verbatim() {
+        let block = video_transcript_prompt("[1] 00:00.000–00:02.000 Hello there.");
+        assert!(block.contains("[1] 00:00.000–00:02.000 Hello there."));
+        assert!(block.contains("<video_transcript>"));
     }
 }

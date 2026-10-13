@@ -105,6 +105,7 @@ impl Agent for CopilotAgent {
     async fn run(&self, ctx: &mut RunContext<()>) -> AgUiResult<RunOutcome> {
         let thread_id = ctx.thread_id().as_str().to_string();
         let messages = history_from(ctx);
+        let video = video_transcript_from(ctx);
 
         if messages.is_empty() {
             return Err(error_message("the request contained no user message"));
@@ -119,6 +120,7 @@ impl Agent for CopilotAgent {
             self.enricher(),
             &thread_id,
             messages,
+            video.as_deref(),
             &mut sink,
         )
         .await
@@ -177,6 +179,26 @@ fn history_from(ctx: &RunContext<()>) -> Vec<ChatMessage> {
         return Vec::new();
     };
     items.iter().filter_map(message_to_chat).collect()
+}
+
+/// Read the open video's transcript from the run's ambient context.
+///
+/// The player page registers it with `useAgentContext({ description:
+/// VIDEO_TRANSCRIPT_CONTEXT, value })`; CopilotKit forwards every registered
+/// entry in the run's `context` array alongside the messages. There is no such
+/// entry when the user is not on the player page, or has no video loaded — in
+/// that case the model simply has no video to talk about.
+fn video_transcript_from(ctx: &RunContext<()>) -> Option<String> {
+    let transcript = ctx
+        .context()
+        .iter()
+        .filter(|entry| entry.description == engine::prompt::VIDEO_TRANSCRIPT_CONTEXT)
+        .map(|entry| entry.value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    (!transcript.is_empty()).then_some(transcript)
 }
 
 /// Convert one serialized AG-UI message into a model message.
@@ -368,7 +390,9 @@ mod tests {
     fn flattens_string_and_part_array_content() {
         assert_eq!(content_to_text(&json!("hello")), "hello");
         assert_eq!(
-            content_to_text(&json!([{ "type": "text", "text": "a" }, { "type": "text", "text": "b" }])),
+            content_to_text(
+                &json!([{ "type": "text", "text": "a" }, { "type": "text", "text": "b" }])
+            ),
             "ab"
         );
         assert_eq!(content_to_text(&Value::Null), "");
@@ -379,11 +403,15 @@ mod tests {
         let chat = |v: Value| message_to_chat(&v);
 
         assert_eq!(
-            chat(json!({ "role": "user", "content": "hi" })).unwrap().role,
+            chat(json!({ "role": "user", "content": "hi" }))
+                .unwrap()
+                .role,
             Role::User
         );
         assert_eq!(
-            chat(json!({ "role": "developer", "content": "rules" })).unwrap().role,
+            chat(json!({ "role": "developer", "content": "rules" }))
+                .unwrap()
+                .role,
             Role::System
         );
         assert!(chat(json!({ "role": "tool", "content": "ignored" })).is_none());
@@ -421,6 +449,47 @@ mod tests {
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].content.as_deref(), Some("hello"));
         assert_eq!(ctx.thread_id().as_str(), "thread-1");
+    }
+
+    /// Build a run context with the given ambient `context` entries.
+    fn ctx_with_context(context: Value) -> RunContext<()> {
+        let input: ag_ui::RunAgentInput = serde_json::from_value(json!({
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "messages": [{ "id": "m1", "role": "user", "content": "what is this about?" }],
+            "tools": [],
+            "context": context
+        }))
+        .expect("RunAgentInput must deserialize the AG-UI request shape");
+        RunContext::<()>::new(input).expect("context").0
+    }
+
+    #[test]
+    fn reads_the_open_videos_transcript_from_ambient_context() {
+        let ctx = ctx_with_context(json!([
+            { "description": "unrelated", "value": "ignore me" },
+            {
+                "description": crate::agent::engine::prompt::VIDEO_TRANSCRIPT_CONTEXT,
+                "value": "[1] 00:00.000–00:02.000 Hello there."
+            }
+        ]));
+
+        assert_eq!(
+            video_transcript_from(&ctx).as_deref(),
+            Some("[1] 00:00.000–00:02.000 Hello there.")
+        );
+    }
+
+    #[test]
+    fn no_video_transcript_when_no_video_is_open() {
+        // Either no context at all, or context unrelated to the player.
+        assert_eq!(video_transcript_from(&ctx_with_context(json!([]))), None);
+        assert_eq!(
+            video_transcript_from(&ctx_with_context(
+                json!([{ "description": "page", "value": "/player" }])
+            )),
+            None
+        );
     }
 
     #[test]

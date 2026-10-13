@@ -186,6 +186,10 @@ macro_rules! emit_or_stop {
 /// The conversation comes from `messages` (AG-UI is stateless per run); the
 /// transcript is also appended to `threads` for observability. The run framing
 /// events (`RUN_STARTED`/`RUN_FINISHED`/`RUN_ERROR`) are the caller's job.
+///
+/// `video` is the transcript of the video the user currently has open, if any.
+/// It rides in the system message so the model can answer questions *about the
+/// video*, not just the chat text.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     cfg: &AgentConfig,
@@ -195,12 +199,19 @@ pub async fn run_turn(
     enricher: &dyn RequestEnricher,
     thread_id: &str,
     messages: Vec<ChatMessage>,
+    video: Option<&str>,
     sink: &mut dyn EventSink,
 ) -> Result<(), LlmError> {
     threads.append(thread_id, &messages);
 
+    let mut system = prompt::system_prompt(cfg);
+    if let Some(transcript) = video.filter(|text| !text.trim().is_empty()) {
+        system.push_str("\n\n");
+        system.push_str(&prompt::video_transcript_prompt(transcript));
+    }
+
     let mut conversation = Vec::with_capacity(messages.len() + 1);
-    conversation.push(ChatMessage::system(prompt::system_prompt(cfg)));
+    conversation.push(ChatMessage::system(system));
     conversation.extend(messages);
     enricher.prepare(&mut conversation);
 

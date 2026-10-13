@@ -1,8 +1,5 @@
 import { Outlet, NavLink, useNavigate, useLocation } from 'react-router';
-// Hidden: the assistant sidebar talks to the Bun `/copilotkit` runtime, which
-// the Rust `sentence-video` backend does not serve. Re-enable together with
-// the /assistant route when that runtime is available again.
-// import { CopilotSidebar } from '@copilotkit/react-core/v2';
+import { CopilotPopup } from '@copilotkit/react-core/v2';
 import { navItems } from '@/router/navigation';
 import { cn } from '@/lib/utils';
 import { useAuth, AUTH_DISABLED } from '@/providers/auth-context';
@@ -115,21 +112,11 @@ export function AppShell() {
         <Outlet />
       </main>
 
-      {/* CopilotKit sidebar — HIDDEN while the frontend targets the Rust
-          `sentence-video` backend, which has no `/copilotkit` runtime. The
-          provider stays mounted in providers/index.tsx so the /assistant route
-          still works if that runtime is started. To restore the sidebar,
-          uncomment it and its import above.
-      <CopilotSidebar
-        agentId="sample_agent"
-        defaultOpen={false}
-        labels={{
-          modalHeaderTitle: 'EnglishPro Assistant',
-          welcomeMessageText:
-            'Hi! I am your English tutor. Ask me to generate a story, explain a word, or review your vocabulary.',
-        }}
-      />
-      */}
+      {/* CopilotKit floating assistant: a chat button pinned to the corner,
+          present on every page. While the player has a video open it publishes
+          that video's transcript as ambient context (see features/player), so
+          the agent can answer questions about what the user is watching. */}
+      <CopilotPopup agentId="sample_agent" />
     </div>
   );
 }
