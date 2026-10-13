@@ -267,6 +267,29 @@ export function PlayerPage() {
     [stopClip]
   );
 
+  /**
+   * Play just one word — the slice of audio the speaker actually voiced for it.
+   *
+   * `&source=1` pins the clip to the original media: the word timings were
+   * measured on the original voice, and for pronunciation the learner wants the
+   * speaker, not the replacement dub.
+   */
+  const playWord = useCallback(
+    (word: Word) => {
+      const id = sessionIdRef.current;
+      if (!id || !(word.end > word.start)) return;
+      stopClip();
+      const clip = new Audio(
+        `/api/session/${encodeURIComponent(id)}/audio?start=${word.start}&end=${word.end}&source=1`
+      );
+      const m = mediaRef.current;
+      if (m) clip.volume = m.volume;
+      clipRef.current = clip;
+      void clip.play().catch(() => {});
+    },
+    [stopClip]
+  );
+
   /** Apply a restored position as soon as the media can accept a seek. */
   const applyPendingPosition = useCallback(() => {
     const m = mediaRef.current;
@@ -649,7 +672,8 @@ export function PlayerPage() {
               {activeCue ? `▶ ${activeCue.text}` : 'Click a sentence below to play it.'}
             </div>
             <p className="text-xs text-muted-foreground">
-              Shortcuts: ↑/↓ previous/next · Space play/pause · L loop · Enter replay.
+              Shortcuts: ↑/↓ previous/next · Space play/pause · L loop · Enter replay. Click a
+              word in a sentence to hear just that word.
             </p>
           </div>
 
@@ -685,7 +709,29 @@ export function PlayerPage() {
                         {fmtTime(cue.start)} – {fmtTime(cue.end)}
                       </span>
                     </div>
-                    <div className="text-sm">{cue.text}</div>
+                    <div className="text-sm">
+                      {/* Real word timings make each word a play button for the
+                          audio the speaker voiced; a cue parsed from a hand-made
+                          subtitle has zeroed timings and stays plain text. Click
+                          is stopped so it does not also start the whole sentence. */}
+                      {cue.words && cue.words.every((w) => w.end > w.start)
+                        ? cue.words.map((w, wi) => (
+                            <span key={wi}>
+                              {wi > 0 ? ' ' : ''}
+                              <span
+                                title={`Play “${w.text}”`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  playWord(w);
+                                }}
+                                className="cursor-pointer rounded-sm hover:bg-primary/20 hover:underline"
+                              >
+                                {w.text}
+                              </span>
+                            </span>
+                          ))
+                        : cue.text}
+                    </div>
                   </button>
                 </li>
               ))}

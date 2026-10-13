@@ -279,7 +279,10 @@ pub fn decode_segment_wav(
 ) -> Result<()> {
     let duration = (end_sec - start_sec).max(0.0);
     // Slice via the max_seconds budget, then offset into the sample stream.
-    let (samples, ch) = decode_to_f32(path, sample_rate, true, None)?;
+    // The budget is `end_sec`, not the whole file: nothing past the slice is
+    // needed, so a clip near the start of a long video does not pay for
+    // decoding the hours after it.
+    let (samples, ch) = decode_to_f32(path, sample_rate, true, Some(end_sec))?;
     let sr = sample_rate as f64;
     let skip = (start_sec * sr) as usize;
     let take = (duration * sr) as usize;

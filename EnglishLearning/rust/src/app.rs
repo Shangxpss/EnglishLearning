@@ -2083,6 +2083,11 @@ impl AppState {
     ///
     /// When the session has a replacement voice track, the clip comes from
     /// that instead, so "play one sentence" uses the dubbed voice too.
+    ///
+    /// `&source=1` forces the original media. This is for word-level clips: the
+    /// word timings in the cues were measured on the original audio, so slicing
+    /// the dubbed track at them would return whatever the replacement voice
+    /// happens to say there. It also keeps word pronunciation the speaker's own.
     fn route_audio(&self, session: &Session, req: &Request) -> Response {
         let start = req
             .query
@@ -2099,8 +2104,9 @@ impl AppState {
         if end <= start {
             return Response::error(400, "end must be greater than start");
         }
+        let force_source = req.query.get("source").map(|v| v.as_str()) == Some("1");
         let track = self.dubbed_track_path(&session.id);
-        let source = if track.is_file() {
+        let source = if !force_source && track.is_file() {
             track.to_string_lossy().into_owned()
         } else {
             session.media_path.clone()
