@@ -351,7 +351,6 @@ pub fn mux_video_audio(
     }
     aenc.set_rate(sr as i32);
     aenc.set_channel_layout(ChannelLayout::MONO);
-    aenc.set_channels(1);
     aenc.set_format(Sample::F32(SampleType::Planar));
     aenc.set_bit_rate(audio_bitrate);
     aenc.set_time_base((1, sr as i32));
@@ -444,7 +443,6 @@ pub fn write_m4a(path: &str, interleaved: &[f32], sample_rate: u32, bit_rate: us
     }
     aenc.set_rate(sample_rate as i32);
     aenc.set_channel_layout(ChannelLayout::MONO);
-    aenc.set_channels(1);
     aenc.set_format(Sample::F32(SampleType::Planar));
     aenc.set_bit_rate(bit_rate);
     aenc.set_time_base((1, sample_rate as i32));

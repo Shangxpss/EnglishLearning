@@ -32,8 +32,6 @@ mod subtitle;
 
 use std::sync::Arc;
 
-use ffmpeg_next::ffi::fprintf;
-
 const MEDIA_EXTS: &[&str] = &[
     "mp4", "mkv", "mov", "webm", "m4a", "mp3", "wav", "ogg", "aac",
 ];

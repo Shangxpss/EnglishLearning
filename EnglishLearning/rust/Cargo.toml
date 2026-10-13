@@ -42,7 +42,17 @@ agent = [
 [dependencies]
 # `build` statically compiles & embeds FFmpeg from source, so the produced
 # binary needs NO system FFmpeg installed on the target machine.
-ffmpeg-next = { version = "6", features = ["build"] }
+#
+# On Windows we CANNOT use `build`: the build script runs `git clone` of
+# FFmpeg (github.com is unreachable from this network), and the subsequent
+# `./configure && make` autotools pipeline does not work natively on Windows.
+# Instead, Windows builds must point at pre-built FFmpeg binaries via the
+# FFMPEG_DIR environment variable (see target section below).
+#
+# NOTE: Windows must use version 9 here because MSYS2 ships FFmpeg 9.x headers.
+# ffmpeg-next versions match FFmpeg API versions — 6 expects FFmpeg 6.x headers,
+# 9 expects FFmpeg 9.x headers.
+ffmpeg-next = { version = "9" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `bundled` compiles the SQLite amalgamation into the binary, so no system
@@ -77,6 +87,14 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 ] }
 futures-util = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
+
+# Non-Windows: build FFmpeg from source (requires git, Unix autotools tools).
+# The `build` feature triggers ffmpeg-sys-next's build script which git-clones
+# FFmpeg and runs ./configure && make — natively supported on Linux/macOS.
+# ffmpeg-next 9.0.0 pulls ffmpeg-sys-next 9.0.0 which builds FFmpeg 9.0 source.
+[target.'cfg(not(windows))'.dependencies]
+ffmpeg-next = { version = "9", features = ["build"] }
+
 [profile.release]
 opt-level = 3
 lto = true
