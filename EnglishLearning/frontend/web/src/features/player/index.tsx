@@ -433,17 +433,31 @@ export function PlayerPage() {
     (i: number) => {
       const m = mediaRef.current;
       const cs = cuesRef.current;
-      if (!m || i < 0 || i >= cs.length) return;
+      if (i < 0 || i >= cs.length) return;
       activeRef.current = i;
       setActiveIdx(i);
+      // Record the sentence as the resume point immediately.
+      saveProgress(i, cs[i].start);
+
+      // No <video> at all — this browser could not take the source, so only the
+      // server can decode this sentence. Speak the same slice the "Sentence
+      // clip" chip plays rather than doing nothing.
+      if (!m) {
+        playClip(i);
+        return;
+      }
+
       m.currentTime = cs[i].start;
-      void m.play().catch(() => {});
+      void m.play().catch((e: unknown) => {
+        // A newer click supersedes this one, so its abort needs no fallback.
+        if (e instanceof Error && e.name === 'AbortError') return;
+        console.warn('sentence playback did not start; using the server clip instead', e);
+        playClip(i);
+      });
       // A dubbed session without a muxed file plays its voice as a separate
       // clip: start this sentence's slice. With the muxed file the video itself
       // carries the dubbed voice, so nothing extra is needed.
       if (dubbedRef.current && !useMuxedRef.current) playClip(i);
-      // Record the sentence as the resume point immediately.
-      saveProgress(i, cs[i].start);
     },
     [saveProgress, playClip]
   );
@@ -467,6 +481,11 @@ export function PlayerPage() {
       const cs = cuesRef.current;
       const i = activeRef.current;
       if (!m || i < 0 || i >= cs.length) return;
+      // A click seeks to the cue start before asking for playback. While that
+      // seek is in flight `currentTime` can still read the old position — a
+      // sentence earlier than the playhead then looks already finished, and the
+      // end branch below would pause the media the instant it was asked to play.
+      if (m.seeking) return;
       const cue = cs[i];
       if (m.currentTime >= cue.end - 0.02) {
         if (loopRef.current) {
@@ -563,6 +582,30 @@ export function PlayerPage() {
   }, [useMuxed, stopClip]);
 
   const activeCue = activeIdx >= 0 ? cues[activeIdx] : undefined;
+
+  /**
+   * Render a cue's text with each word as its own play button.
+   *
+   * Real word timings make each word clickable for the audio the speaker voiced;
+   * a cue parsed from a hand-made subtitle has zeroed timings and stays plain text.
+   */
+  const renderCueWords = (cue: Cue) =>
+    cue.words && cue.words.every((w) => w.end > w.start) ? (
+      cue.words.map((w, wi) => (
+        <span key={wi}>
+          {wi > 0 ? ' ' : ''}
+          <span
+            title={`Play “${w.text}”`}
+            onClick={() => playWord(w)}
+            className="cursor-pointer rounded-sm hover:bg-primary/20 hover:underline"
+          >
+            {w.text}
+          </span>
+        </span>
+      ))
+    ) : (
+      <>{cue.text}</>
+    );
 
   return (
     <div className="space-y-6">
@@ -669,7 +712,14 @@ export function PlayerPage() {
               </p>
             )}
             <div className="min-h-10 rounded-md border bg-muted/40 px-3 py-2 text-sm">
-              {activeCue ? `▶ ${activeCue.text}` : 'Click a sentence below to play it.'}
+              {activeCue ? (
+                <>
+                  <span className="mr-1">▶</span>
+                  {renderCueWords(activeCue)}
+                </>
+              ) : (
+                'Click a sentence below to play it.'
+              )}
             </div>
             <p className="text-xs text-muted-foreground">
               Shortcuts: ↑/↓ previous/next · Space play/pause · L loop · Enter replay. Click a
@@ -709,29 +759,7 @@ export function PlayerPage() {
                         {fmtTime(cue.start)} – {fmtTime(cue.end)}
                       </span>
                     </div>
-                    <div className="text-sm">
-                      {/* Real word timings make each word a play button for the
-                          audio the speaker voiced; a cue parsed from a hand-made
-                          subtitle has zeroed timings and stays plain text. Click
-                          is stopped so it does not also start the whole sentence. */}
-                      {cue.words && cue.words.every((w) => w.end > w.start)
-                        ? cue.words.map((w, wi) => (
-                            <span key={wi}>
-                              {wi > 0 ? ' ' : ''}
-                              <span
-                                title={`Play “${w.text}”`}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  playWord(w);
-                                }}
-                                className="cursor-pointer rounded-sm hover:bg-primary/20 hover:underline"
-                              >
-                                {w.text}
-                              </span>
-                            </span>
-                          ))
-                        : cue.text}
-                    </div>
+                    <div className="text-sm">{cue.text}</div>
                   </button>
                 </li>
               ))}
