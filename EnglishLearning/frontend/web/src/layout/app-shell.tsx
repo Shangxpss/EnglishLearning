@@ -1,14 +1,86 @@
 import { Outlet, NavLink, useNavigate, useLocation } from 'react-router';
-import { CopilotPopup } from '@copilotkit/react-core/v2';
+import { CopilotPopup, useAgent } from '@copilotkit/react-core/v2';
 import { navItems } from '@/router/navigation';
 import { cn } from '@/lib/utils';
 import { useAuth, AUTH_DISABLED } from '@/providers/auth-context';
-import { useEffect } from 'react';
+import { getChatThreadId, NEW_CHAT_THREAD_EVENT } from '@/lib/chat-thread';
+import { getChatMessages, type ChatMessage } from '@/lib/chat-api';
+import { useEffect, useRef, useState } from 'react';
+
+/** Runtime agent id the floating assistant is registered under (see the provider). */
+const ASSISTANT_AGENT_ID = 'sample_agent';
+
+/**
+ * Map the runtime's stored transcript onto the AG-UI messages the popup renders.
+ *
+ * Only user/assistant text is kept: the server records nothing else (tool
+ * traffic is dropped at ingestion) and the chat view has no bubble for it. Ids
+ * are synthesised because AG-UI messages carry one and the store does not.
+ */
+function seedMessages(history: ChatMessage[]) {
+  return history
+    .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content?.trim())
+    .map((m, i) => ({
+      id: `history-${i}`,
+      role: m.role as 'user' | 'assistant',
+      content: m.content as string,
+    }));
+}
+
+/**
+ * Seed the floating assistant with the pinned thread's stored transcript.
+ *
+ * The v2 chat view never fetches thread history — that lives behind the
+ * licence-gated threads drawer — and the AG-UI client mints a fresh thread per
+ * page load, so without this the popup would come back empty after a reload
+ * even though the conversation is still on the server. Runs once per thread and
+ * never overwrites a conversation already in progress.
+ */
+function ChatThreadHydrator({ threadId }: { threadId: string }) {
+  const { agent, isReady } = useAgent({ agentId: ASSISTANT_AGENT_ID });
+  const seeded = useRef<string | null>(null);
+
+  useEffect(() => {
+    // The provisional pre-sync agent is a stand-in that gets swapped out, so
+    // only touch the real one.
+    if (!isReady || seeded.current === threadId) return;
+    let cancelled = false;
+    getChatMessages(threadId)
+      .then((history) => {
+        if (cancelled) return;
+        seeded.current = threadId;
+        const seed = seedMessages(history);
+        // Preserve a conversation already on screen (the fetch may have raced a
+        // just-sent message); an empty history is a fresh thread, which must
+        // clear the previous one rather than keep showing it.
+        if (seed.length > 0 && agent.messages.length > 0) return;
+        agent.setMessages(seed);
+      })
+      .catch(() => {
+        // History is a convenience: a failed read just means an empty popup.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isReady, agent, threadId]);
+
+  return null;
+}
 
 export function AppShell() {
   const { user, isAuthenticated, isLoading, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+
+  // The thread the floating assistant is pinned to. Read once, then follow
+  // "New chat" events so the popup (mounted for the whole session) switches to
+  // a fresh conversation without a reload.
+  const [chatThreadId, setChatThreadId] = useState(() => getChatThreadId());
+  useEffect(() => {
+    const onNewThread = () => setChatThreadId(getChatThreadId());
+    window.addEventListener(NEW_CHAT_THREAD_EVENT, onNewThread);
+    return () => window.removeEventListener(NEW_CHAT_THREAD_EVENT, onNewThread);
+  }, []);
 
   // Redirect to login if not authenticated.
   // AUTH BYPASS: authentication is disabled, so this guard is skipped and the
@@ -116,7 +188,8 @@ export function AppShell() {
           present on every page. While the player has a video open it publishes
           that video's transcript as ambient context (see features/player), so
           the agent can answer questions about what the user is watching. */}
-      <CopilotPopup agentId="sample_agent" />
+      <ChatThreadHydrator threadId={chatThreadId} />
+      <CopilotPopup agentId={ASSISTANT_AGENT_ID} threadId={chatThreadId} />
     </div>
   );
 }

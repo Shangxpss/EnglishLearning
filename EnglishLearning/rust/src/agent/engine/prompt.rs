@@ -88,13 +88,14 @@ pub fn video_transcript_prompt(transcript: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::config::DEFAULT_CATALOG_ID;
 
     #[test]
     fn prompt_names_the_model_and_catalog() {
         let cfg = AgentConfig::default();
         let prompt = system_prompt(&cfg);
         assert!(prompt.contains("deepseek-chat"));
-        assert!(prompt.contains("generative-agent-catalog"));
+        assert!(prompt.contains(DEFAULT_CATALOG_ID));
     }
 
     #[test]

@@ -28,8 +28,10 @@
 //! | `GET` | `/health` | liveness |
 //! | `GET` | `/copilotkit/info` | agent + catalog information |
 //! | `GET`/`POST` | `/copilotkit/threads` | list / create threads |
+//! | `GET` | `/copilotkit/threads/{thread_id}/messages` | read a thread's transcript |
 //! | `DELETE` | `/copilotkit/threads/{thread_id}` | forget a thread |
 //! | `POST` | `/copilotkit/agent/{agent_id}/stop/{thread_id}` | see [`stop_run`] |
+//! | `POST` | `/copilotkit/agent/{agent_id}/connect` | see [`connect_run`] |
 
 pub mod middleware;
 
@@ -46,8 +48,8 @@ use ag_ui::{Event, RunOutcome};
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -78,11 +80,17 @@ impl CopilotAgent {
         let llm = OpenAiClient::new(&cfg).map_err(|e| e.to_string())?;
         // Read `cfg` before it is moved into the struct below.
         let middleware = A2uiMiddleware::new(cfg.catalog_id.clone());
+        // A resolved data dir means a durable history; `None` (tests) keeps it in
+        // memory. The file sits beside `sessions.db` / `logs.db`.
+        let threads = match cfg.data_dir.as_deref() {
+            Some(dir) => ThreadStore::open(&std::path::Path::new(dir).join("threads.db"))?,
+            None => ThreadStore::new(),
+        };
         Ok(CopilotAgent {
             cfg,
             registry: ToolRegistry::with_builtins(),
             llm,
-            threads: ThreadStore::new(),
+            threads,
             middleware,
             started: Instant::now(),
         })
@@ -282,6 +290,18 @@ async fn create_thread() -> impl IntoResponse {
     (StatusCode::CREATED, Json(json!({ "id": thread_id })))
 }
 
+/// `GET /copilotkit/threads/{thread_id}/messages` — the recorded transcript.
+///
+/// The client has no thread API in this version (its built-in drawer is behind
+/// CopilotKit Intelligence), so this is what the app's own history view reads.
+async fn thread_messages(
+    State(agent): State<Arc<CopilotAgent>>,
+    Path(thread_id): Path<String>,
+) -> impl IntoResponse {
+    let messages = agent.threads.history(&thread_id);
+    Json(json!({ "threadId": thread_id, "messages": messages }))
+}
+
 async fn delete_thread(
     State(agent): State<Arc<CopilotAgent>>,
     Path(thread_id): Path<String>,
@@ -316,6 +336,40 @@ async fn stop_run(
     )
 }
 
+/// `POST /copilotkit/agent/{agent_id}/connect`
+///
+/// The chat issues this as soon as it is pinned to a thread: with an explicit
+/// thread id it tries to *join* a run already streaming for that thread, so a
+/// reloaded UI can resume a turn that was in flight. This runtime keeps no run
+/// store — a run lives and dies inside its own SSE response, which is the same
+/// reason [`stop_run`] has nothing to signal — so there is never a run to join.
+///
+/// An empty event stream is the honest reply, and matches the CopilotKit
+/// in-memory runner, which completes immediately for a thread it does not know.
+/// It has to be `200`: the client paints an error banner over the chat for any
+/// other status, so answering `404` makes a pinned chat look broken.
+async fn connect_run(
+    State(agent): State<Arc<CopilotAgent>>,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if agent_id != agent.cfg.agent_id {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown agent '{agent_id}'") })),
+        )
+            .into_response();
+    }
+
+    let mut response = Response::new(axum::body::Body::empty());
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Server
 // ─────────────────────────────────────────────────────────────────────────
@@ -328,9 +382,14 @@ pub fn router(agent: Arc<CopilotAgent>) -> Router {
         .route("/copilotkit/threads", get(list_threads).post(create_thread))
         .route("/copilotkit/threads/{thread_id}", delete(delete_thread))
         .route(
+            "/copilotkit/threads/{thread_id}/messages",
+            get(thread_messages),
+        )
+        .route(
             "/copilotkit/agent/{agent_id}/stop/{thread_id}",
             post(stop_run),
         )
+        .route("/copilotkit/agent/{agent_id}/connect", post(connect_run))
         .with_state(Arc::clone(&agent))
         // `route_agui` supplies request parsing, ordering verification, SSE
         // framing, content negotiation and disconnect cancellation.
@@ -384,6 +443,7 @@ pub fn serve(cfg: AgentConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::config::DEFAULT_CATALOG_ID;
     use crate::agent::llm::Role;
 
     #[test]
@@ -496,7 +556,7 @@ mod tests {
     fn agent_reports_the_configured_identity_and_tools() {
         let agent = CopilotAgent::new(AgentConfig::default()).unwrap();
         assert_eq!(agent.cfg.agent_id, "sample_agent");
-        assert_eq!(agent.middleware.catalog_id(), "generative-agent-catalog");
+        assert_eq!(agent.middleware.catalog_id(), DEFAULT_CATALOG_ID);
         assert!(agent.registry.names().contains(&"display_register_form"));
         assert!(!agent.cfg.has_credentials());
     }

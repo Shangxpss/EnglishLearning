@@ -21,7 +21,7 @@ pub mod op {
     pub const DELETE_SURFACE: &str = "deleteSurface";
 }
 
-/// Component names from the `generative-agent-catalog` used by this project.
+/// Component names from the `english-learning-catalog` used by this project.
 ///
 /// Only names that exist in the frontend catalog may be emitted — the Python
 /// system prompt says the same thing ("never invent new ones").

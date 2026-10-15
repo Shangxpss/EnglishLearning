@@ -11,6 +11,7 @@ import { AssistantPage } from '@/features/assistant';
 import { PlayerPage } from '@/features/player';
 import { ManagePage } from '@/features/manage';
 import { LogsPage } from '@/features/logs';
+import { ChatHistoryPage } from '@/features/chat-history';
 import { LoginPage } from '@/features/auth/login';
 import { SignupPage } from '@/features/auth/signup';
 
@@ -31,6 +32,9 @@ export const routes: RouteObject[] = [
       // /logs reads the server's logs.db — requests + background jobs — so a
       // problem noticed after the fact can still be traced.
       { path: 'logs', element: <LogsPage /> },
+      // /chat-history reads threads.db — past conversations with the floating
+      // assistant, recorded by the agent runtime.
+      { path: 'chat-history', element: <ChatHistoryPage /> },
 
       // ── Legacy Python/FastAPI routes (hidden from the nav) ───────────────
       // These call endpoints the Rust binary does not implement. They stay

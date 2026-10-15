@@ -183,8 +183,10 @@ macro_rules! emit_or_stop {
 
 /// Run one agent turn, writing AG-UI events into `sink`.
 ///
-/// The conversation comes from `messages` (AG-UI is stateless per run); the
-/// transcript is also appended to `threads` for observability. The run framing
+/// The conversation comes from `messages` (AG-UI is stateless per run); a copy is
+/// also recorded against `threads` for chat history. That copy is the client's
+/// cumulative history — replaced, not appended, so turns don't pile up — and the
+/// assistant's own reply is appended as it is produced. The run framing
 /// events (`RUN_STARTED`/`RUN_FINISHED`/`RUN_ERROR`) are the caller's job.
 ///
 /// `video` is the transcript of the video the user currently has open, if any.
@@ -202,7 +204,7 @@ pub async fn run_turn(
     video: Option<&str>,
     sink: &mut dyn EventSink,
 ) -> Result<(), LlmError> {
-    threads.append(thread_id, &messages);
+    threads.record(thread_id, &messages);
 
     let mut system = prompt::system_prompt(cfg);
     if let Some(transcript) = video.filter(|text| !text.trim().is_empty()) {

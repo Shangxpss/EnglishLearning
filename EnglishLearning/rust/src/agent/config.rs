@@ -15,7 +15,12 @@ use std::sync::OnceLock;
 /// Default agent id — must match `CopilotKit agent="…"` in the frontend.
 pub const DEFAULT_AGENT_ID: &str = "sample_agent";
 /// Default A2UI catalog id — must match `createCatalog({ catalogId })`.
-pub const DEFAULT_CATALOG_ID: &str = "generative-agent-catalog";
+///
+/// The frontend registers its catalog under this id
+/// (`frontend/web/src/a2ui/catalog.ts`), and every `createSurface` operation
+/// names it, so a mismatch makes the client renderer report
+/// "Catalog not found" and drop the whole surface.
+pub const DEFAULT_CATALOG_ID: &str = "english-learning-catalog";
 /// Default model served by DeepSeek's OpenAI-compatible endpoint.
 pub const DEFAULT_MODEL: &str = "deepseek-chat";
 /// Default OpenAI-compatible base URL.
@@ -46,6 +51,9 @@ pub struct AgentConfig {
     pub temperature: f32,
     /// Maximum model↔tool round-trips per run (guards against loops).
     pub max_steps: usize,
+    /// Folder holding `threads.db`. `None` keeps chat history in memory only
+    /// (what the tests get); the running service always resolves a real folder.
+    pub data_dir: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -55,14 +63,15 @@ impl Default for AgentConfig {
             port: 4000,
             agent_id: DEFAULT_AGENT_ID.to_string(),
             agent_name: "sample_agent".to_string(),
-            agent_description:
-                "A helpful AI assistant powered by DeepSeek with tool capabilities.".to_string(),
+            agent_description: "A helpful AI assistant powered by DeepSeek with tool capabilities."
+                .to_string(),
             catalog_id: DEFAULT_CATALOG_ID.to_string(),
             model: DEFAULT_MODEL.to_string(),
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: String::new(),
             temperature: 0.0,
             max_steps: 8,
+            data_dir: None,
         }
     }
 }
@@ -83,6 +92,7 @@ impl AgentConfig {
     /// | `AGENT_CATALOG_ID` | [`Self::catalog_id`] |
     /// | `DEEPSEEK_BASE_URL` | [`Self::base_url`] |
     /// | `DEEPSEEK_API_KEY` | [`Self::api_key`] |
+    /// | `AGENT_DATA_DIR` | [`Self::data_dir`] |
     pub fn from_env() -> Self {
         load_dotenv();
         let mut cfg = AgentConfig::default();
@@ -110,6 +120,9 @@ impl AgentConfig {
         if let Some(v) = env_string("DEEPSEEK_API_KEY") {
             cfg.api_key = v;
         }
+        if let Some(v) = env_string("AGENT_DATA_DIR") {
+            cfg.data_dir = Some(v);
+        }
         cfg
     }
 
@@ -131,7 +144,10 @@ impl AgentConfig {
 
 /// Read a non-empty environment variable, trimming surrounding whitespace.
 fn env_string(key: &str) -> Option<String> {
-    env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -212,7 +228,9 @@ fn load_dotenv_from(path: &Path) {
 
     let mut loaded = 0usize;
     for line in text.lines() {
-        let Some((key, value)) = parse_dotenv_line(line) else { continue };
+        let Some((key, value)) = parse_dotenv_line(line) else {
+            continue;
+        };
         // An already-exported variable wins over the file, so testing a one-off
         // key needs no edit to `.env`.
         if env::var_os(&key).is_some() {
@@ -226,7 +244,10 @@ fn load_dotenv_from(path: &Path) {
         }
         loaded += 1;
     }
-    eprintln!("sentence-video agent: loaded {loaded} variable(s) from {}", path.display());
+    eprintln!(
+        "sentence-video agent: loaded {loaded} variable(s) from {}",
+        path.display()
+    );
 }
 
 /// Parse one dotenv line into a key/value pair.
@@ -240,7 +261,10 @@ fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
-    let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+    let line = line
+        .strip_prefix("export ")
+        .map(str::trim_start)
+        .unwrap_or(line);
 
     let (key, value) = line.split_once('=')?;
     let key = key.trim();
@@ -257,7 +281,9 @@ fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
         value[1..value.len() - 1].to_string()
     } else {
         // Unquoted: an unescaped `#` starts a trailing comment.
-        let cut = value.find(" #").or_else(|| value.strip_prefix('#').map(|_| 0));
+        let cut = value
+            .find(" #")
+            .or_else(|| value.strip_prefix('#').map(|_| 0));
         match cut {
             Some(0) => String::new(),
             Some(at) => value[..at].trim_end().to_string(),
@@ -276,7 +302,10 @@ mod tests {
     fn joins_chat_completions_url_without_double_slash() {
         let mut cfg = AgentConfig::default();
         cfg.base_url = "https://api.deepseek.com/".to_string();
-        assert_eq!(cfg.chat_completions_url(), "https://api.deepseek.com/chat/completions");
+        assert_eq!(
+            cfg.chat_completions_url(),
+            "https://api.deepseek.com/chat/completions"
+        );
     }
 
     #[test]
@@ -297,7 +326,10 @@ mod tests {
             parse_dotenv_line("AGENT_PORT=4000 # the agent port"),
             Some(("AGENT_PORT".into(), "4000".into()))
         );
-        assert_eq!(parse_dotenv_line("EMPTY="), Some(("EMPTY".into(), String::new())));
+        assert_eq!(
+            parse_dotenv_line("EMPTY="),
+            Some(("EMPTY".into(), String::new()))
+        );
     }
 
     #[test]
@@ -315,7 +347,10 @@ mod tests {
             Some(("SECRET".into(), "abc#def".into()))
         );
         // Unquoted, the `#` opens a comment only when preceded by whitespace.
-        assert_eq!(parse_dotenv_line("SECRET=abc#def"), Some(("SECRET".into(), "abc#def".into())));
+        assert_eq!(
+            parse_dotenv_line("SECRET=abc#def"),
+            Some(("SECRET".into(), "abc#def".into()))
+        );
     }
 
     #[test]

@@ -141,6 +141,13 @@ export function PlayerPage() {
   const sessionIdRef = useRef<string | null>(null);
   /** Position to apply once the media element has loaded its metadata. */
   const pendingPositionRef = useRef<number | null>(null);
+  /**
+   * Sentence the user clicked before the media had loaded its metadata. Seeking
+   * such an element is a no-op, so the click is remembered and started from
+   * `onLoadedMetadata` — otherwise clicking a sentence on a video that is still
+   * loading silently does nothing.
+   */
+  const pendingCueRef = useRef<number | null>(null);
 
   // Keep the async interval/keyboard handlers reading current values.
   cuesRef.current = cues;
@@ -325,6 +332,7 @@ export function PlayerPage() {
         setSession(data);
         setCues(loadedCues);
         sessionIdRef.current = id;
+        pendingCueRef.current = null;
         setError(null);
 
         // Restore where this session was left off last time.
@@ -444,6 +452,14 @@ export function PlayerPage() {
       // clip" chip plays rather than doing nothing.
       if (!m) {
         playClip(i);
+        return;
+      }
+
+      // The media is still fetching its metadata: seeking it now would be
+      // dropped and the sentence would never play. Hand the click to
+      // `onLoadedMetadata`, which starts it as soon as seeking is possible.
+      if (m.readyState < 1) {
+        pendingCueRef.current = i;
         return;
       }
 
@@ -632,7 +648,16 @@ export function PlayerPage() {
                 src={mediaSrc}
                 controls
                 preload="metadata"
-                onLoadedMetadata={applyPendingPosition}
+                onLoadedMetadata={() => {
+                  applyPendingPosition();
+                  // A sentence clicked while the video was still loading: the
+                  // saved position above no longer matters, the click wins.
+                  const pendingCue = pendingCueRef.current;
+                  if (pendingCue != null) {
+                    pendingCueRef.current = null;
+                    playIndex(pendingCue);
+                  }
+                }}
                 onPause={() => {
                   stopClip();
                   const m = mediaRef.current;

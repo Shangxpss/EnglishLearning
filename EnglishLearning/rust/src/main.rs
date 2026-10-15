@@ -52,7 +52,7 @@ fn print_usage() {
          \x20   --port <n>             bind port (default 4000)\n\
          \x20   --model <name>         model id (default deepseek-chat)\n\
          \x20   --agent-id <id>        agent id (default sample_agent)\n\
-         \x20   --catalog-id <id>      A2UI catalog id (default generative-agent-catalog)\n\
+         \x20   --catalog-id <id>      A2UI catalog id (default english-learning-catalog)\n\
          \x20   --max-steps <n>        max model turns per run (default 8)\n\
          \x20   --api-key <key>        API key; prefer the DEEPSEEK_API_KEY env var\n\n\
          PLAY MODE (opens default browser):\n\
@@ -760,10 +760,21 @@ fn run_agent_command(args: &[String]) {
                     cfg.api_key = v.clone();
                 }
             }
+            "--data-dir" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    cfg.data_dir = Some(v.clone());
+                }
+            }
             other => eprintln!("sentence-video agent: ignoring unknown argument '{other}'"),
         }
         i += 1;
     }
+
+    // Always resolve to a real folder so chat history survives a restart: the
+    // thread database lives next to `sessions.db`. `--data-dir` (or
+    // `AGENT_DATA_DIR`) wins; otherwise the platform user-data directory.
+    cfg.data_dir = Some(resolve_data_dir(cfg.data_dir.take()).display().to_string());
 
     if let Err(e) = agent::run(cfg) {
         eprintln!("sentence-video agent: {e}");
