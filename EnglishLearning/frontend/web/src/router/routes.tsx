@@ -10,6 +10,7 @@ import { ReadingPage } from '@/features/reading';
 import { AssistantPage } from '@/features/assistant';
 import { PlayerPage } from '@/features/player';
 import { ManagePage } from '@/features/manage';
+import { QueuePage } from '@/features/queue';
 import { LogsPage } from '@/features/logs';
 import { LoginPage } from '@/features/auth/login';
 import { SignupPage } from '@/features/auth/signup';
@@ -25,6 +26,9 @@ export const routes: RouteObject[] = [
       // /player uses /api/sessions, /api/session, /cues, /media, /audio —
       // all implemented in rust/src/app.rs.
       { path: 'player', element: <PlayerPage /> },
+      // /queue submits batches to the server's durable job queue (POST
+      // /api/jobs) and reports the outcome, pushed over GET /api/jobs/events.
+      { path: 'queue', element: <QueuePage /> },
       // /manage is CRUD over the processed videos plus their processing state;
       // /player is for watching. `?session=<id>` opens one specific session.
       { path: 'manage', element: <ManagePage /> },

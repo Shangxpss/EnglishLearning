@@ -461,3 +461,165 @@ export async function clearLogs(): Promise<number> {
   return data.cleared ?? 0;
 }
 
+// ── Job queue (rust/src/jobs) ─────────────────────────────────────────────
+//
+// Submitting a batch is asynchronous: the POST returns a handle per file in
+// milliseconds, the work runs on bounded server threads, and the outcome
+// arrives over `GET /api/jobs/events` as Server-Sent Events. That is why the
+// queue page can push a folder of clips and walk away.
+//
+// The SSE feed is **at-least-once** (it replays the whole snapshot on connect
+// and again after a reconnect), so the same `(job_id, state)` can be delivered
+// more than once — consumers dedupe on that pair.
+
+export type JobState = "queued" | "running" | "done" | "failed" | "cancelled";
+
+/** A job that has finished, one way or another. */
+export const JOB_TERMINAL_STATES: JobState[] = ["done", "failed", "cancelled"];
+
+/** One row of `GET /api/jobs`. */
+export interface Job {
+  id: string;
+  media_path: string;
+  kind: string;
+  state: JobState;
+  /** Where a running build is: `decode` → `transcribe` → `align`. */
+  stage: string | null;
+  done: number;
+  total: number;
+  attempts: number;
+  max_attempts: number;
+  last_error: string | null;
+  /** Set once the job produced a session, so a finished job is deep-linkable. */
+  session_id: string | null;
+  /** Unix epoch seconds. */
+  enqueued_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  elapsed_secs: number;
+}
+
+/** The payload the SSE feed pushes — ids + a state; details come from `GET /api/jobs`. */
+export interface JobEvent {
+  /** Payload version, so a shape change is negotiable. */
+  v: number;
+  job_id: string;
+  kind: string;
+  state: JobState;
+  media_path: string;
+  session_id?: string;
+  stage?: string;
+  done: number;
+  total: number;
+  attempts: number;
+  error?: string;
+  finished_at: number;
+}
+
+/**
+ * Ask the server to open the native OS file dialog for **several** files at
+ * once and hand back their absolute paths. Returns an empty list when the user
+ * cancels.
+ */
+export async function pickMediaFilesOnServer(): Promise<string[]> {
+  const resp = await fetch(`/api/pick-file?kind=media&multi=1`, {
+    method: "POST",
+  });
+  if (!resp.ok) throw new Error(await readError(resp));
+  const data: { paths: string[] } = await resp.json();
+  return data.paths ?? [];
+}
+
+/** What `POST /api/jobs` reports back per file. */
+export interface SubmitJobsResult {
+  /** Accepted files and the handle to watch them with. */
+  jobs: { job_id: string; media_path: string }[];
+  /**
+   * Files refused individually rather than failing the whole batch — a path
+   * that is missing, say. One bad file must not cost the other nine.
+   */
+  rejected: { media_path: string; error: string }[];
+}
+
+/**
+ * `POST /api/jobs` — push a batch onto the queue. Returns `202` immediately, so
+ * the caller polls or listens for the outcome instead of blocking.
+ *
+ * Re-submitting a file that is already queued or running returns that job's
+ * existing id rather than duplicating it.
+ */
+export async function submitJobs(
+  mediaPaths: string[],
+): Promise<SubmitJobsResult> {
+  const resp = await fetch("/api/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ media_paths: mediaPaths }),
+  });
+  if (!resp.ok) throw new Error(await readError(resp));
+  return resp.json();
+}
+
+/** `GET /api/jobs` — every job, newest first (`state` / `kind` / `limit` narrow it). */
+export async function listJobs(
+  filter: { state?: JobState | ""; kind?: string; limit?: number } = {},
+): Promise<Job[]> {
+  const params = new URLSearchParams();
+  if (filter.state) params.set("state", filter.state);
+  if (filter.kind) params.set("kind", filter.kind);
+  if (filter.limit) params.set("limit", String(filter.limit));
+  const qs = params.toString();
+  const resp = await fetch(`/api/jobs${qs ? `?${qs}` : ""}`);
+  if (!resp.ok) throw new Error(await readError(resp));
+  const data: { jobs: Job[] } = await resp.json();
+  return data.jobs ?? [];
+}
+
+/**
+ * `POST /api/jobs/{id}/cancel` — a queued job stops outright; a running one
+ * stops at its next stage boundary, because a whisper pass or an alignment
+ * window cannot be cut in half. The state it is in right now is returned.
+ */
+export async function cancelJob(
+  jobId: string,
+): Promise<{ job_id: string; state: JobState }> {
+  const resp = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+  });
+  if (!resp.ok) throw new Error(await readError(resp));
+  return resp.json();
+}
+
+/**
+ * Subscribe to `GET /api/jobs/events`. Every open tab gets the current snapshot
+ * first, then live updates, so no polling is needed to see a job change state.
+ *
+ * Returns the unsubscribe function; call it on unmount, or the server keeps a
+ * stream open for a page nobody is looking at.
+ */
+export function subscribeJobEvents(handlers: {
+  onEvent: (event: JobEvent) => void;
+  onError?: (message: string) => void;
+}): () => void {
+  const source = new EventSource("/api/jobs/events");
+  const listener = (msg: MessageEvent<string>) => {
+    try {
+      handlers.onEvent(JSON.parse(msg.data) as JobEvent);
+    } catch {
+      // One malformed frame is not worth tearing the stream down for.
+    }
+  };
+  source.addEventListener("job", listener as EventListener);
+  source.onerror = () => {
+    // EventSource reconnects on its own after a transient drop; only a
+    // permanently closed stream is worth reporting.
+    if (source.readyState === EventSource.CLOSED) {
+      handlers.onError?.("the job notification stream is closed");
+    }
+  };
+  return () => {
+    source.removeEventListener("job", listener as EventListener);
+    source.close();
+  };
+}
+

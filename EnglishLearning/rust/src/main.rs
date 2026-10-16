@@ -20,6 +20,9 @@ mod align;
 mod app;
 mod asr;
 mod db;
+// Durable job queue + completion notification: the `jobs` table, the worker
+// pool and the push transport, all behind two injectable ports.
+mod jobs;
 mod logs;
 mod media;
 mod models;
@@ -29,6 +32,9 @@ mod platform;
 mod segmenter;
 mod server;
 mod subtitle;
+// The axum web layer: one listener serving the legacy `server::Handler` routes
+// (bridged with `spawn_blocking`) plus the native async job API and SSE feed.
+mod web;
 
 use std::sync::Arc;
 
@@ -1043,6 +1049,7 @@ fn main() {
     let mut dub_proxy: Option<String> = None;
     let mut log_level: Option<String> = None;
     let mut no_log_file = false;
+    let mut workers: usize = 0; // 0 = not set; resolved below from env/default
 
     let mut i = 0;
     while i < args.len() {
@@ -1079,6 +1086,12 @@ fn main() {
                 }
             }
             "--no-log-file" => no_log_file = true,
+            "--workers" => {
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|n| n.parse::<usize>().ok()) {
+                    workers = n;
+                }
+            }
             "--dub-engine" => {
                 i += 1;
                 dub_engine = args.get(i).cloned();
@@ -1143,6 +1156,9 @@ fn main() {
         .send();
 
     let db_path = data_dir.join("sessions.db");
+    // The job queue lives in the *same* database file, so remember whichever
+    // path actually opened — including the fallback — and reuse it verbatim.
+    let mut queue_path = db_path.clone();
     // Which storage engine this is stays entirely here: the rest of the app only
     // ever sees `dyn Store`, so swapping the backend never touches request code.
     let db: Arc<dyn db::Store> = match db::Db::open(&db_path) {
@@ -1157,6 +1173,7 @@ fn main() {
             // Degrade gracefully rather than refusing to start: fall back to a
             // temp database.
             let fallback_dir = std::env::temp_dir().join("sentence-video");
+            queue_path = fallback_dir.join("sessions.db");
             eprintln!(
                 "sentence-video: {e}; falling back to {}",
                 fallback_dir.join("sessions.db").display()
@@ -1182,7 +1199,34 @@ fn main() {
             }
         }
     };
-    let state = Arc::new(app::AppState::new(cache_dir, data_dir, db));
+
+    // The queue is the second injected port, chosen right beside the database.
+    // It is the same bundled SQLite file the database just opened successfully,
+    // so a failure here means the file is unusable and there is nothing to
+    // degrade to. No broker, no extra process, no new runtime dependency.
+    let queue: Arc<dyn jobs::JobQueue> = match jobs::SqliteQueue::open(&queue_path) {
+        Ok(queue) => {
+            println!("sentence-video: job queue → {}", queue_path.display());
+            logs::info("queue", "job queue opened")
+                .detail(queue_path.display().to_string())
+                .send();
+            Arc::new(queue)
+        }
+        Err(e) => {
+            eprintln!("sentence-video: {e}");
+            logs::error("queue", "cannot open the job queue; exiting")
+                .detail(e)
+                .send();
+            std::process::exit(1);
+        }
+    };
+
+    let state = Arc::new(app::AppState::new(
+        cache_dir,
+        data_dir,
+        db,
+        Arc::clone(&queue),
+    ));
 
     // Dubbing: which TTS backend the 'Dub audio' option uses. Flags win, then
     // the environment, then the built-in default. The engine itself is not
@@ -1268,23 +1312,70 @@ fn main() {
         }
     }
 
-    let bind = format!("{host}:{port}");
-    let state_arc: Arc<app::AppState> = Arc::clone(&state);
-    let handler: Arc<dyn server::Handler + Send + Sync> = state_arc;
-    let addr = server::start(&bind, handler);
-    logs::info("server", "listening")
-        .detail(format!("http://{addr}/"))
+    // The worker pool that drains the queue. Started before any traffic, so a
+    // job submitted by the very first request is picked up immediately.
+    //
+    // Default concurrency is 1: these stages are CPU-bound (FFmpeg, whisper,
+    // the aligner) and each one holds a model or weights in memory, so the
+    // queue's job here is to *bound* concurrency, not to inflate it.
+    let worker_count = if workers > 0 {
+        workers
+    } else {
+        env_setting("SENTENCE_VIDEO_WORKERS")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1)
+    };
+    // Recover jobs a previous run left mid-flight before claiming anything new —
+    // the one guarantee an in-memory map can never offer.
+    match queue.reclaim_expired() {
+        Ok(0) => {}
+        Ok(n) => logs::warn("queue", "reclaimed jobs left by a previous run")
+            .detail(format!("{n} job(s) requeued"))
+            .send(),
+        Err(e) => logs::warn("queue", "could not reclaim expired jobs")
+            .detail(e)
+            .send(),
+    }
+    let _pool = jobs::WorkerPool::start(
+        worker_count,
+        Arc::clone(&queue),
+        Arc::clone(&state) as Arc<dyn jobs::JobRunner>,
+        state.notifier(),
+        std::time::Duration::from_secs(30),
+    );
+    println!("sentence-video: job queue ready ({worker_count} worker(s))");
+    logs::info("queue", "worker pool started")
+        .detail(format!("{worker_count} worker(s) · lease=30s"))
         .send();
 
-    // Open the browser once the server reports a bound address.
-    if open_browser_flag {
-        let url = format!("http://{addr}/");
-        println!("sentence-video: auto-opening browser at {url}");
-        open_browser(&url);
-    }
-
-    // Keep the process alive until Ctrl-C.
-    loop {
-        std::thread::park();
+    let bind = format!("{host}:{port}");
+    let app = web::router(Arc::clone(&state));
+    // A multi-threaded runtime hosts the web layer (and stays alive for the
+    // whole process; `block_on` below returns only when the server stops). The
+    // job workers are plain OS threads, so they need no runtime at all.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("sentence-video-web")
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("sentence-video: cannot start the network runtime: {e}");
+            std::process::exit(1);
+        });
+    let served = runtime.block_on(web::serve(&bind, app, |addr| {
+        logs::info("server", "listening")
+            .detail(format!("http://{addr}/"))
+            .send();
+        // Open the browser once the real address (port included) is known.
+        if open_browser_flag {
+            let url = format!("http://{addr}/");
+            println!("sentence-video: auto-opening browser at {url}");
+            open_browser(&url);
+        }
+    }));
+    if let Err(e) = served {
+        eprintln!("sentence-video: {e}");
+        logs::error("server", "the media server stopped").detail(e).send();
+        std::process::exit(1);
     }
 }

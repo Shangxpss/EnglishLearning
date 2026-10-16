@@ -11,6 +11,10 @@ const queryClient = new QueryClient({
   },
 });
 
+// NOTE: this sits *above* the router, so it must not contain anything that
+// needs router context (a `<Link>`, `useNavigate`). The job-notification stack
+// links into the player, so it is mounted inside `AppShell` instead — see
+// providers/job-notifications.tsx.
 export function RootProvider({ children }: { children: ReactNode }) {
   return (
     <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
