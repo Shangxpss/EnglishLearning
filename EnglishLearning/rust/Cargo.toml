@@ -20,7 +20,7 @@ path = "src/main.rs"
 # (Bun) and `AI-Demo/backend` (Python). It is on by default so one binary serves
 # both the media player and the agent, matching the single-executable goal.
 # Drop it with `--no-default-features --features asr-whisper` when only the
-# media player is needed (this also removes tokio/axum/reqwest).
+# media player is needed (this also removes ag-ui/reqwest).
 default = ["asr-whisper", "agent"]
 asr-whisper = ["dep:whisper-rs"]
 # wav2vec2 CTC forced alignment (`sentence-video align`). OFF by default, and
@@ -29,15 +29,12 @@ asr-whisper = ["dep:whisper-rs"]
 # however need ~378 MB of weights on disk at runtime (they are far too large to
 # embed), so it is not part of the default build.
 asr-align = []
-agent = [
-    "dep:ag-ui",
-    "dep:axum",
-    "dep:tokio",
-    "dep:tower-http",
-    "dep:reqwest",
-    "dep:futures-util",
-    "dep:async-stream",
-]
+# `axum` is the production web crate now, so it is NOT gated: the media server,
+# the durable job API and the SSE job feed all live on the same axum listener
+# (see `src/web.rs`). `tokio`/`tower-http`/`async-stream` travel with it. The
+# old media-only `--no-default-features` build is consciously given up as a
+# result (documented in `batch-job-queue-and-notification-stack.md` §4.3).
+agent = ["dep:ag-ui", "dep:reqwest"]
 
 [dependencies]
 # `build` statically compiles & embeds FFmpeg from source, so the produced
@@ -62,7 +59,25 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # BUILD machine only) and links it statically.
 whisper-rs = { version = "0.16.0", optional = true }
 
-# ── agent service (feature "agent") ──────────────────────────────────────────
+# ── web layer (always compiled) ──────────────────────────────────────────────
+# axum is the production web crate: the media server (replacing the hand-rolled
+# `server.rs` accept loop), the durable job API and the SSE job feed all share
+# this one listener/stack. `tokio` and `tower-http` travel with it.
+axum = { version = "0.8" }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+] }
+tower-http = { version = "0.6", features = ["cors"] }
+# `async_stream` builds the SSE job feed from a `tokio::sync::broadcast` receiver;
+# `futures-util` supplies the `Stream` trait that feed is written against.
+async-stream = { version = "0.3" }
+futures-util = { version = "0.3" }
+
+# ── agent service (feature "agent") ─────────────────────────────────────────
 # Replaces `@copilotkit/runtime` (Bun) and FastAPI + LangGraph (Python).
 #
 # `ag-ui` is the AG-UI protocol SDK: it owns the event vocabulary (all 36 event
@@ -71,22 +86,11 @@ whisper-rs = { version = "0.16.0", optional = true }
 # deliberately leaves out: the model client, the tool runtime and the A2UI
 # payloads. Its `axum` feature is the only one that pulls in tokio.
 ag-ui = { version = "0.4", optional = true, features = ["axum"] }
-axum = { version = "0.8", optional = true }
-tokio = { version = "1", optional = true, features = [
-    "rt-multi-thread",
-    "macros",
-    "net",
-    "time",
-    "sync",
-] }
-tower-http = { version = "0.6", optional = true, features = ["cors"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = [
     "json",
     "stream",
     "rustls-tls",
 ] }
-futures-util = { version = "0.3", optional = true }
-async-stream = { version = "0.3", optional = true }
 
 # Non-Windows: build FFmpeg from source (requires git, Unix autotools tools).
 # The `build` feature triggers ffmpeg-sys-next's build script which git-clones

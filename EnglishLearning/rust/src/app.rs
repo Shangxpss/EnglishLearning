@@ -1,6 +1,10 @@
 //! Application state + request routing.
 
 use crate::db::{Progress, SourceKey, Store};
+use crate::jobs::{
+    self, Job, JobEvent, JobFailure, JobFilter, JobPayload, JobQueue, JobRunner, JobStage,
+    Notifier, SseHub,
+};
 use crate::logs;
 use crate::media;
 use crate::models::{Cue, Session};
@@ -201,6 +205,17 @@ pub struct AppState {
     build_jobs: Arc<Mutex<HashMap<String, BuildProgress>>>,
     /// Injected persistence port; the concrete backend is chosen at startup.
     db: Arc<dyn Store>,
+    /// Injected durable work queue — a second port, chosen at startup exactly
+    /// like `db`. Today it is the embedded SQLite queue; a broker adapter can
+    /// replace it for a multi-node deploy without touching this file.
+    queue: Arc<dyn JobQueue>,
+    /// Where job status is pushed. Defaults to the local SSE hub; replaceable
+    /// with an MQTT publisher via [`Self::with_notifier`].
+    notifier: Arc<dyn Notifier>,
+    /// The local SSE feed subscribers attach to. Held concretely (not as the
+    /// `Notifier` trait) because subscribing is transport-specific: only the
+    /// in-process hub has a `broadcast::Receiver` to hand out.
+    hub: Arc<SseHub>,
 }
 
 impl AppState {
@@ -208,8 +223,12 @@ impl AppState {
         cache_dir: std::path::PathBuf,
         data_dir: std::path::PathBuf,
         db: Arc<dyn Store>,
+        queue: Arc<dyn JobQueue>,
     ) -> Self {
         std::fs::create_dir_all(&cache_dir).ok();
+        // The default push transport is the in-process SSE hub. It doubles as the
+        // notifier so no fan-out layer is needed until a second transport exists.
+        let hub = Arc::new(SseHub::new());
         AppState {
             sessions: Mutex::new(HashMap::new()),
             cache_dir,
@@ -220,7 +239,32 @@ impl AppState {
             platform_jobs: Arc::new(Mutex::new(HashMap::new())),
             build_jobs: Arc::new(Mutex::new(HashMap::new())),
             db,
+            queue,
+            notifier: Arc::clone(&hub) as Arc<dyn Notifier>,
+            hub,
         }
+    }
+
+    /// Replace the default notification transport (an MQTT publisher, say). The
+    /// local SSE hub stays subscribed either way.
+    ///
+    /// Kept as the documented swap point for the broker-era notifier: it is the
+    /// one place a second transport gets installed, exactly as `db`/`queue` are
+    /// chosen at startup. Unused until such an adapter exists.
+    #[allow(dead_code)]
+    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
+        self.notifier = notifier;
+        self
+    }
+
+    /// The transport the worker pool publishes through.
+    pub fn notifier(&self) -> Arc<dyn Notifier> {
+        Arc::clone(&self.notifier)
+    }
+
+    /// Attach a listener to the local job feed (the SSE route does this).
+    pub fn subscribe_jobs(&self) -> tokio::sync::broadcast::Receiver<JobEvent> {
+        self.hub.subscribe()
     }
 
     /// Where the browser-playable (H.264) copy of this media lives, or `None`
@@ -449,6 +493,217 @@ impl AppState {
                 }
             }
         });
+    }
+
+    /// The blocking twin of [`Self::ensure_playable_async`], for job workers:
+    /// the same guards and the same `playable_jobs` bookkeeping, but run inline
+    /// so the job is only "done" once the browser-playable copy actually exists.
+    fn ensure_playable_sync(&self, media_path: &str) -> Result<(), JobFailure> {
+        let Some(dst) = self.playable_path(media_path) else {
+            return Ok(()); // nothing to do — the browser can play this one
+        };
+        if dst.is_file() {
+            return Ok(());
+        }
+        if let Some(dir) = dst.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| JobFailure::Failed(format!("cannot create {}: {e}", dir.display())))?;
+        }
+        {
+            // Reflect "running" in the map the player reads, so `video.transcode`
+            // reports progress instead of looking idle while the job works.
+            let mut jobs = self.playable_jobs.lock().unwrap();
+            if !jobs.contains_key(media_path) {
+                jobs.insert(media_path.to_string(), "running".to_string());
+            }
+        }
+        logs::info("transcode", "re-encoding the source to H.264")
+            .media(media_path)
+            .send();
+        let started = std::time::Instant::now();
+        let result = media::transcode_to_h264(media_path, &dst.to_string_lossy(), None);
+        let mut jobs = self.playable_jobs.lock().unwrap();
+        match result {
+            Ok(()) => {
+                jobs.remove(media_path);
+                logs::info("transcode", "browser-playable copy written")
+                    .media(media_path)
+                    .detail(dst.display().to_string())
+                    .duration_ms(started.elapsed().as_millis() as i64)
+                    .send();
+                Ok(())
+            }
+            Err(e) => {
+                jobs.insert(media_path.to_string(), format!("failed: {e}"));
+                logs::error("transcode", "re-encoding to H.264 failed")
+                    .media(media_path)
+                    .detail(&e)
+                    .duration_ms(started.elapsed().as_millis() as i64)
+                    .send();
+                Err(JobFailure::Failed(format!("re-encoding failed: {e}")))
+            }
+        }
+    }
+
+    // ── job queue API ───────────────────────────────────────────────────────
+    // The synchronous `POST /api/session` path is untouched; these sit beside it
+    // as the async one: submit, get a handle, be notified.
+
+    /// Enqueue a batch of media files and return immediately, one handle per
+    /// file. Files that do not exist are rejected individually rather than
+    /// failing the whole batch.
+    pub fn enqueue_jobs(
+        &self,
+        media_paths: Vec<String>,
+        kind: Option<String>,
+        align: Option<bool>,
+        subtitle_path: Option<String>,
+    ) -> serde_json::Value {
+        let kind = kind.unwrap_or_else(|| "build".to_string());
+        let payload = serde_json::to_string(&JobPayload {
+            align,
+            subtitle_path,
+        })
+        .ok();
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+        for raw in media_paths {
+            let media_path = media::normalize_path(&raw);
+            let Some(cache_key) = media_cache_key(&media_path) else {
+                rejected.push(serde_json::json!({
+                    "media_path": media_path,
+                    "error": "media file not found",
+                }));
+                continue;
+            };
+            let spec = jobs::JobSpec {
+                media_path: media_path.clone(),
+                cache_key,
+                kind: kind.clone(),
+                max_attempts: 3,
+                payload: payload.clone(),
+            };
+            match self.queue.enqueue(spec) {
+                Ok(job_id) => {
+                    // Announce the new (or rejoined) job so open pages update.
+                    if let Some(job) = self.queue.get(&job_id) {
+                        self.publish_job(&job, None);
+                    }
+                    accepted
+                        .push(serde_json::json!({ "job_id": job_id, "media_path": media_path }));
+                }
+                Err(e) => rejected.push(serde_json::json!({
+                    "media_path": media_path,
+                    "error": e,
+                })),
+            }
+        }
+        serde_json::json!({ "jobs": accepted, "rejected": rejected })
+    }
+
+    /// Every known job, newest first, as the API returns it.
+    pub fn list_jobs(&self, filter: &JobFilter) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = self
+            .queue
+            .list(filter)
+            .iter()
+            .map(|job| self.job_json(job))
+            .collect();
+        serde_json::json!({ "jobs": rows })
+    }
+
+    /// One job, or `None` for an unknown id.
+    pub fn get_job(&self, id: &str) -> Option<serde_json::Value> {
+        self.queue
+            .get(&id.to_string())
+            .map(|job| self.job_json(&job))
+    }
+
+    /// Ask `id` to stop and report the resulting state. `None` = unknown id.
+    pub fn cancel_job(&self, id: &str) -> Option<serde_json::Value> {
+        let id = id.to_string();
+        self.queue.get(&id)?;
+        if let Err(e) = self.queue.request_cancel(&id) {
+            logs::warn("queue", "could not cancel a job")
+                .detail(e)
+                .send();
+        }
+        let job = self.queue.get(&id)?;
+        self.publish_job(&job, None);
+        Some(serde_json::json!({ "job_id": job.id, "state": job.state }))
+    }
+
+    /// The current snapshot, for the SSE route to replay on connect so a page
+    /// opened after the work started is immediately in sync.
+    pub fn list_job_events(&self) -> Vec<JobEvent> {
+        self.queue
+            .list(&JobFilter::default())
+            .iter()
+            .map(|job| JobEvent::from_job(job, None))
+            .collect()
+    }
+
+    /// A job row as JSON, with the pipeline's live stage overlaid on a running
+    /// job (the stored `stage` only refreshes every half second).
+    fn job_json(&self, job: &Job) -> serde_json::Value {
+        let mut value = serde_json::to_value(job).unwrap_or(serde_json::Value::Null);
+        if job.state == jobs::STATE_RUNNING {
+            if let Some(stage) = self.build_stage(&job.media_path) {
+                value["stage"] = serde_json::Value::String(stage.stage);
+                value["done"] = serde_json::json!(stage.done);
+                value["total"] = serde_json::json!(stage.total);
+            }
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "elapsed_secs".to_string(),
+                serde_json::json!(job.elapsed_secs()),
+            );
+        }
+        value
+    }
+
+    /// The live build stage for a media path, in the shape the queue stores.
+    /// `None` when nothing is registered for it right now.
+    ///
+    /// Two phases can be in flight, and the second one is the long one: the
+    /// build (decode → transcribe → align) is registered in `build_jobs`, but
+    /// once it is over the browser-playable H.264 copy is still being encoded
+    /// (see [`Self::ensure_playable_sync`]). Reporting "working" for a job that
+    /// is half an hour into a transcode would look stuck, so that phase is
+    /// named too — it has no counters of its own, because FFmpeg reports none.
+    fn build_stage(&self, media_path: &str) -> Option<JobStage> {
+        if let Some(build) = self.build_jobs.lock().ok()?.get(media_path) {
+            let (stage, done, total) = match build.stage {
+                transcribe::BuildStage::Decode => ("decode", 0, 0),
+                transcribe::BuildStage::Transcribe => ("transcribe", 0, 0),
+                transcribe::BuildStage::Align { done, total } => ("align", done as i64, total as i64),
+            };
+            return Some(JobStage {
+                stage: stage.to_string(),
+                done,
+                total,
+            });
+        }
+        let transcoding = self
+            .playable_jobs
+            .lock()
+            .ok()?
+            .get(media_path)
+            .is_some_and(|state| state == "running");
+        transcoding.then(|| JobStage {
+            stage: "transcode".to_string(),
+            done: 0,
+            total: 0,
+        })
+    }
+
+    fn publish_job(&self, job: &Job, error: Option<String>) {
+        if let Err(e) = self.notifier.publish(&JobEvent::from_job(job, error)) {
+            logs::warn("queue", "could not publish a job event")
+                .detail(e)
+                .send();
+        }
     }
 
     /// Where this session's replacement voice track lives, if one was made.
@@ -1113,6 +1368,52 @@ fn level_for_status(status: u16) -> logs::Level {
     }
 }
 
+impl JobRunner for AppState {
+    /// Execute one claimed job on a worker thread.
+    ///
+    /// `build` means the whole "make this file usable" pipeline — create the
+    /// session (transcribing and aligning when needed) *and* write the
+    /// browser-playable copy — so the completion notice really does mean the
+    /// file is ready to play, not merely parsed.
+    fn run(&self, job: &Job) -> Result<Option<String>, JobFailure> {
+        let payload = JobPayload::parse(job.payload.as_deref());
+        let align = payload.align.unwrap_or_else(|| crate::asr::config().align);
+        match job.kind.as_str() {
+            "build" => {
+                let session = self
+                    .build_session(&job.media_path, payload.subtitle_path, false, align)
+                    .map_err(|(_, msg)| {
+                        // Cancelling is a clean stop, not a failure: it must not
+                        // consume a retry attempt.
+                        if msg == transcribe::CANCELLED {
+                            JobFailure::Cancelled
+                        } else {
+                            JobFailure::Failed(msg)
+                        }
+                    })?;
+                self.ensure_playable_sync(&job.media_path)?;
+                Ok(Some(session.id))
+            }
+            other => Err(JobFailure::Failed(format!("unsupported job kind: {other}"))),
+        }
+    }
+
+    fn request_cancel(&self, media_path: &str) {
+        let media_path = media::normalize_path(media_path);
+        if let Ok(map) = self.build_jobs.lock() {
+            if let Some(build) = map.get(&media_path) {
+                build
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn stage(&self, media_path: &str) -> Option<JobStage> {
+        self.build_stage(media_path)
+    }
+}
+
 impl Handler for AppState {
     /// The single chokepoint every HTTP request passes through: time the
     /// dispatch, then record it (except on the high-frequency paths listed in
@@ -1262,12 +1563,16 @@ impl AppState {
         }
     }
 
-    /// `POST /api/pick-file?kind=media|subtitle`
+    /// `POST /api/pick-file?kind=media|subtitle[&multi=1]`
     ///
     /// Opens the native OS file dialog on the server machine and returns the
     /// chosen absolute path as `{"path": "..."}` (or `{"path": null}` when the
-    /// user cancels). Guarded against cross-origin callers so a random website
-    /// cannot drive the local dialog.
+    /// user cancels). With `multi=1` the dialog allows several selections and
+    /// the answer is `{"paths": [...]}` instead — an empty list on cancel, so a
+    /// queue submission can push a whole folder in one gesture.
+    ///
+    /// Guarded against cross-origin callers so a random website cannot drive the
+    /// local dialog.
     fn pick_file(&self, req: &Request) -> Response {
         let origin = req.headers.get("origin").map(|s| s.as_str());
         if !local_origin_ok(origin) {
@@ -1277,6 +1582,17 @@ impl AppState {
             );
         }
         let kind = req.query.get("kind").map(|s| s.as_str()).unwrap_or("media");
+        let multi = req.query.get("multi").map(|s| s.as_str()).unwrap_or("");
+        if multi == "1" || multi == "true" {
+            return match crate::picker::pick_files(kind) {
+                Ok(paths) => Response::text(
+                    200,
+                    "application/json; charset=utf-8",
+                    serde_json::json!({ "paths": paths }).to_string(),
+                ),
+                Err(e) => Response::error(500, &e),
+            };
+        }
         match crate::picker::pick_file(kind) {
             Ok(Some(path)) => Response::text(
                 200,
@@ -2131,7 +2447,7 @@ impl AppState {
                     }
                 };
                 let _ = std::fs::remove_file(&out_path);
-                Response::bytes(200, "OK", "audio/wav", data)
+                Response::bytes(200, "audio/wav", data)
             }
             Err(e) => Response::error(500, &e),
         }
@@ -2213,7 +2529,6 @@ fn stream_file_range(path: &str, content_type: &str, req: &Request) -> Response 
             if s >= len {
                 return Response {
                     status: 416,
-                    reason: "Range Not Satisfiable",
                     headers: vec![("Content-Range".into(), format!("bytes */{len}"))],
                     body: Vec::new(),
                 };
@@ -2225,7 +2540,6 @@ fn stream_file_range(path: &str, content_type: &str, req: &Request) -> Response 
             let _ = file.read_exact(&mut buf);
             return Response {
                 status: 206,
-                reason: "Partial Content",
                 headers: vec![
                     ("Content-Type".into(), content_type.to_string()),
                     ("Accept-Ranges".into(), "bytes".into()),
@@ -2247,7 +2561,6 @@ fn stream_file_range(path: &str, content_type: &str, req: &Request) -> Response 
     let _ = file.read_to_end(&mut buf);
     Response {
         status: 200,
-        reason: "OK",
         headers: vec![
             ("Content-Type".into(), content_type.to_string()),
             ("Accept-Ranges".into(), "bytes".into()),
@@ -2278,7 +2591,7 @@ fn parse_range(spec: &str, len: u64) -> Option<(u64, u64)> {
 }
 
 fn bytes_ok(data: &[u8], content_type: &str) -> Response {
-    Response::bytes(200, "OK", content_type, data.to_vec())
+    Response::bytes(200, content_type, data.to_vec())
 }
 
 /// True when the last path segment looks like a static asset (contains a `.`),
@@ -2316,6 +2629,13 @@ fn local_origin_ok(origin: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway durable queue in the same directory as a test's database.
+    /// Tests never start a worker pool, so nothing drains it — they only assert
+    /// that the API surface above the queue behaves.
+    fn test_queue(dir: &std::path::Path) -> Arc<dyn crate::jobs::JobQueue> {
+        Arc::new(crate::jobs::SqliteQueue::open(&dir.join("jobs.db")).expect("open queue"))
+    }
 
     #[test]
     fn spa_fallback_distinguishes_routes_from_assets() {
@@ -2447,7 +2767,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sv-app-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         let db = crate::db::Db::open(&dir.join("test.db")).expect("open db");
-        let app = AppState::new(dir.join("cache"), dir.join("data"), Arc::new(db));
+        let app = AppState::new(
+            dir.join("cache"),
+            dir.join("data"),
+            Arc::new(db),
+            test_queue(&dir),
+        );
 
         let session = Session {
             id: "s1".to_string(),
@@ -2514,7 +2839,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sv-build-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         let db = crate::db::Db::open(&dir.join("test.db")).expect("open db");
-        let app = AppState::new(dir.join("cache"), dir.join("data"), Arc::new(db));
+        let app = AppState::new(
+            dir.join("cache"),
+            dir.join("data"),
+            Arc::new(db),
+            test_queue(&dir),
+        );
 
         let builds = |app: &AppState| -> serde_json::Value {
             serde_json::from_slice(&app.list_builds().body).unwrap()
@@ -2523,11 +2853,18 @@ mod tests {
         // Nothing submitted yet: the Manage page has nothing to report.
         assert_eq!(builds(&app).as_array().unwrap().len(), 0);
 
-        let sink = app.begin_build("/media/a.mp4");
+        // `begin_build` registers the caller's spelling verbatim while the cancel
+        // endpoint normalizes what arrives over HTTP, so both are derived from one
+        // normalized path here — otherwise the two spellings differ (on Windows
+        // `/media/a.mp4` is not considered absolute and becomes `C:\media\a.mp4`).
+        let media = media::normalize_path("/media/a.mp4");
+        let other = media::normalize_path("/media/other.mp4");
+
+        let sink = app.begin_build(&media);
         // `true` from the sink is "keep going" — the pipeline unwinds on `false`.
         assert!(sink(transcribe::BuildStage::Transcribe));
         let list = builds(&app);
-        assert_eq!(list[0]["media_path"], "/media/a.mp4");
+        assert_eq!(list[0]["media_path"], media.as_str());
         assert_eq!(list[0]["stage"], "transcribe");
         // Whisper is one pass over the file, so it has no countable unit.
         assert_eq!(list[0]["total"], 0);
@@ -2541,31 +2878,31 @@ mod tests {
 
         // Cancelling goes through the same sink the pipeline reports to, so the
         // flag must reach whoever is running the build.
-        let cancel = |media: &str| Request {
+        let cancel = |path: &str| Request {
             method: "POST".to_string(),
             path: "/api/builds/cancel".to_string(),
             query: HashMap::new(),
             headers: HashMap::new(),
-            body: serde_json::json!({ "media_path": media })
+            body: serde_json::json!({ "media_path": path })
                 .to_string()
                 .into_bytes(),
         };
         // A path nobody is building is a 404, and must not cancel the live build.
-        assert_eq!(app.cancel_build(&cancel("/media/other.mp4")).status, 404);
+        assert_eq!(app.cancel_build(&cancel(&other)).status, 404);
         assert!(sink(transcribe::BuildStage::Align { done: 2, total: 4 }));
-        assert_eq!(app.cancel_build(&cancel("/media/a.mp4")).status, 200);
+        assert_eq!(app.cancel_build(&cancel(&media)).status, 200);
         // Raised flag: the next stage boundary tells the build to stop.
         assert!(!sink(transcribe::BuildStage::Align { done: 3, total: 4 }));
 
         // A finished build must vanish, or the page shows a phantom row forever.
-        app.end_build("/media/a.mp4");
+        app.end_build(&media);
         assert_eq!(builds(&app).as_array().unwrap().len(), 0);
 
         // A window finishing just after the build ended is ignored, not an error —
         // and there is nothing left to cancel.
         sink(transcribe::BuildStage::Align { done: 4, total: 4 });
         assert_eq!(builds(&app).as_array().unwrap().len(), 0);
-        assert_eq!(app.cancel_build(&cancel("/media/a.mp4")).status, 404);
+        assert_eq!(app.cancel_build(&cancel(&media)).status, 404);
     }
 
     /// Muxing is the only step that produces a file the user takes away, so the
@@ -2581,7 +2918,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let db = crate::db::Db::open(&dir.join("test.db")).expect("open db");
         let data = dir.join("data");
-        let app = AppState::new(dir.join("cache"), data.clone(), Arc::new(db));
+        let app = AppState::new(
+            dir.join("cache"),
+            data.clone(),
+            Arc::new(db),
+            test_queue(&dir),
+        );
 
         let session = Session {
             id: "s1".to_string(),
@@ -2649,7 +2991,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = crate::db::Db::open(&dir.join("test.db")).expect("open db");
-        let app = AppState::new(dir.join("cache"), dir.join("data"), Arc::new(db));
+        let app = AppState::new(
+            dir.join("cache"),
+            dir.join("data"),
+            Arc::new(db),
+            test_queue(&dir),
+        );
 
         // A real file: the export writes next to it and does not invent a folder.
         let media = dir.join("lecture.mp4");
@@ -2747,7 +3094,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sv-open-dir-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         let db = crate::db::Db::open(&dir.join("test.db")).expect("open db");
-        let app = AppState::new(dir.join("cache"), dir.join("data"), Arc::new(db));
+        let app = AppState::new(
+            dir.join("cache"),
+            dir.join("data"),
+            Arc::new(db),
+            test_queue(&dir),
+        );
 
         let session = Session {
             id: "s1".to_string(),
