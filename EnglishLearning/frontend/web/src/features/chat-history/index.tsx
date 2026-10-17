@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { startNewChatThread } from "@/lib/chat-thread";
+import {
+  CHAT_THREAD_CHANGED_EVENT,
+  getChatThreadId,
+  setChatThreadId,
+  startNewChatThread,
+} from "@/lib/chat-thread";
 import {
   getChatMessages,
   listChatThreads,
@@ -12,9 +17,13 @@ import {
 /**
  * Chat History — past conversations with the floating CopilotKit assistant.
  *
- * The agent runtime records every turn into `threads.db`, so this page is a
- * read-only view of that store: the conversations on the left, the selected
- * one's transcript on the right.
+ * The agent runtime records every turn into `threads.db`, so this page lists
+ * those conversations on the left with the selected one's transcript on the
+ * right.
+ *
+ * "Continue in chat" re-pins the floating assistant to the selected thread, so
+ * the conversation picks up where it left off instead of starting over; "New
+ * chat" does the opposite and hands it a fresh thread.
  *
  * CopilotKit ships a `<CopilotThreadsDrawer>`, but it is gated behind the paid
  * "CopilotKit Intelligence" license and does not fetch against a self-hosted
@@ -70,6 +79,14 @@ export function ChatHistoryPage() {
   const [loadingThreads, setLoadingThreads] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The thread the floating assistant is currently on, so the list can show it.
+  const [pinned, setPinned] = useState(() => getChatThreadId());
+
+  useEffect(() => {
+    const onThreadChange = () => setPinned(getChatThreadId());
+    window.addEventListener(CHAT_THREAD_CHANGED_EVENT, onThreadChange);
+    return () => window.removeEventListener(CHAT_THREAD_CHANGED_EVENT, onThreadChange);
+  }, []);
 
   const loadThreads = useCallback(async () => {
     setLoadingThreads(true);
@@ -115,6 +132,7 @@ export function ChatHistoryPage() {
   }, [selected]);
 
   const active = threads.find((t) => t.id === selected);
+  const selectedIsPinned = !!selected && selected === pinned;
 
   return (
     <div className="flex h-[calc(100vh-8rem)] gap-4">
@@ -126,9 +144,10 @@ export function ChatHistoryPage() {
             <Button
               size="sm"
               variant="ghost"
-              title="Pin a fresh thread for the floating assistant"
+              title="Restart the floating assistant on a fresh conversation"
               onClick={() => {
                 startNewChatThread();
+                setSelected(null);
                 void loadThreads();
               }}
             >
@@ -166,7 +185,14 @@ export function ChatHistoryPage() {
                       t.id === selected ? "bg-primary/10" : "hover:bg-muted",
                     )}
                   >
-                    <div className="truncate font-mono text-xs">{shortId(t.id)}</div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="truncate font-mono text-xs">{shortId(t.id)}</span>
+                      {t.id === pinned && (
+                        <span className="shrink-0 rounded bg-primary/15 px-1 text-[10px] font-medium text-primary">
+                          in chat
+                        </span>
+                      )}
+                    </div>
                     <div className="mt-0.5 flex items-center justify-between text-[11px] text-muted-foreground">
                       <span>{t.messages} messages</span>
                       <span>{fmtTime(t.updated_at)}</span>
@@ -181,10 +207,25 @@ export function ChatHistoryPage() {
 
       {/* Transcript */}
       <section className="flex min-w-0 flex-1 flex-col rounded-lg border bg-card">
-        <div className="border-b px-4 py-2">
+        <div className="flex items-center justify-between gap-3 border-b px-4 py-2">
           <h2 className="truncate font-mono text-xs text-muted-foreground">
             {active ? active.id : "—"}
           </h2>
+          {selected && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="shrink-0"
+              title="Continue this conversation in the floating assistant"
+              disabled={selectedIsPinned}
+              onClick={() => {
+                setChatThreadId(selected);
+                setPinned(selected);
+              }}
+            >
+              {selectedIsPinned ? "In chat" : "Continue in chat"}
+            </Button>
+          )}
         </div>
 
         <div className="flex-1 space-y-3 overflow-y-auto p-4">

@@ -1,18 +1,29 @@
-//! Conversation state — a durable per-thread transcript log.
+//! Conversation state — a durable per-thread transcript log, and the **source
+//! of record** for what the model remembers.
 //!
-//! AG-UI is stateless per run: the client sends the whole conversation with every
-//! request, and the model context comes from *those* messages rather than from
-//! anything kept here. This store keeps a readable copy per thread so the service
-//! can offer chat history, and — because it survives restarts — so a reload can
-//! resume the same thread.
+//! AG-UI is stateless per run: the client re-sends the whole conversation with
+//! every request. That payload is a *claim* about the thread, not the truth. A
+//! client may forward only its last message (trimming history it no longer needs
+//! to carry — see CopilotKit's message-history guide), and a server that
+//! replaced its copy with each payload would erase everything earlier. So the
+//! direction is inverted here: the model context is built from what is stored,
+//! and the forwarded conversation is used only to locate the turn the store has
+//! not recorded yet.
 //!
 //! Two write shapes, both driven by [`crate::agent::engine::run_turn`]:
 //!
-//! * [`ThreadStore::record`] replaces a thread's transcript with the conversation
-//!   the client just sent. The client's history is cumulative, so replacing keeps
-//!   the stored copy in sync without duplicating it on every turn.
+//! * [`ThreadStore::merge`] appends the *unrecorded* part of the forwarded
+//!   conversation and returns the whole transcript — the memory handed to the
+//!   model. A client that forwards the full history does not duplicate it, and a
+//!   client that forwards a single message cannot erase what came before.
 //! * [`ThreadStore::append`] adds messages to the end — how the assistant's own
 //!   reply (which the client has not echoed back yet) is captured mid-run.
+//!
+//! Reference: CopilotKit's runtime keeps a per-thread snapshot of the agent's
+//! messages and replays it to a client joining a thread
+//! (`@copilotkit/runtime/dist/v2/runtime/runner/in-memory.mjs` — `appendRun`
+//! replaces `store.messagesSnapshot`, `connect` replays, `getThreadMessages`
+//! reads it back). Same idea, one store per thread instead of one per process.
 //!
 //! Storage is SQLite through the crate's `bundled` feature, so nothing extra is
 //! installed on the end user's machine. [`ThreadStore::new`] uses an in-memory
@@ -82,35 +93,51 @@ impl ThreadStore {
              );",
         )
         .expect("initialize the thread database");
-        ThreadStore { conn: Mutex::new(conn) }
+        ThreadStore {
+            conn: Mutex::new(conn),
+        }
     }
 
-    /// Replace `thread_id`'s transcript with the conversation the client sent.
+    /// Record the part of `forwarded` this thread does not hold yet, and return
+    /// the whole transcript — the history the model should be given.
     ///
-    /// The incoming history is cumulative, so this is the authoritative copy; it
-    /// also means a re-run can never append the same turn twice.
-    pub fn record(&self, thread_id: &str, messages: &[ChatMessage]) {
-        if messages.is_empty() {
-            return;
-        }
+    /// The read and the write share one lock, so two turns cannot interleave. On
+    /// a storage failure the stored transcript is returned unchanged: losing a
+    /// new turn matters less than failing the user's chat over.
+    pub fn merge(&self, thread_id: &str, forwarded: &[ChatMessage]) -> Vec<ChatMessage> {
         let now = now_ms();
         let mut conn = self.lock();
+        let mut history = read_history(&conn, thread_id);
+
+        let pending = pending_turn(&history, forwarded);
+        if pending.is_empty() {
+            return history;
+        }
+
         let tx = match conn.transaction() {
             Ok(tx) => tx,
-            Err(e) => return report("begin transcript", e),
+            Err(e) => {
+                report("begin transcript", e);
+                return history;
+            }
         };
         let result = (|| -> rusqlite::Result<()> {
-            tx.execute("DELETE FROM messages WHERE thread_id = ?1", params![thread_id])?;
             touch(&tx, thread_id, now)?;
-            for (seq, message) in messages.iter().enumerate() {
-                insert_message(&tx, thread_id, seq as i64, message)?;
+            let start: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE thread_id = ?1",
+                params![thread_id],
+                |row| row.get(0),
+            )?;
+            for (offset, message) in pending.iter().enumerate() {
+                insert_message(&tx, thread_id, start + offset as i64, message)?;
             }
             Ok(())
         })();
         match result.and_then(|()| tx.commit()) {
-            Ok(()) => {}
-            Err(e) => report("record transcript", e),
+            Ok(()) => history.extend(pending),
+            Err(e) => report("merge transcript", e),
         }
+        history
     }
 
     /// Add `messages` to the end of `thread_id`, creating the thread if needed.
@@ -144,28 +171,7 @@ impl ThreadStore {
 
     /// A copy of the recorded transcript, oldest first.
     pub fn history(&self, thread_id: &str) -> Vec<ChatMessage> {
-        let conn = self.lock();
-        let mut stmt = match conn
-            .prepare("SELECT role, content FROM messages WHERE thread_id = ?1 ORDER BY seq")
-        {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                report("read transcript", e);
-                return Vec::new();
-            }
-        };
-        let rows = stmt.query_map(params![thread_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        });
-        let mut out = Vec::new();
-        if let Ok(rows) = rows {
-            for (role, content) in rows.flatten() {
-                if let Some(message) = chat_from_row(&role, &content) {
-                    out.push(message);
-                }
-            }
-        }
-        out
+        read_history(&self.lock(), thread_id)
     }
 
     /// Forget a thread. Returns whether it existed.
@@ -182,7 +188,10 @@ impl ThreadStore {
             .execute("DELETE FROM threads WHERE id = ?1", params![thread_id])
             .unwrap_or(0)
             > 0;
-        if let Err(e) = tx.execute("DELETE FROM messages WHERE thread_id = ?1", params![thread_id]) {
+        if let Err(e) = tx.execute(
+            "DELETE FROM messages WHERE thread_id = ?1",
+            params![thread_id],
+        ) {
             report("delete transcript", e);
         }
         if let Err(e) = tx.commit() {
@@ -213,15 +222,18 @@ impl ThreadStore {
                 messages: row.get::<_, i64>(3)? as usize,
             })
         });
-        rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
+        rows.map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
     }
 
     /// Number of known threads.
     pub fn len(&self) -> usize {
         let conn = self.lock();
-        conn.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get::<_, i64>(0))
-            .map(|n| n as usize)
-            .unwrap_or(0)
+        conn.query_row("SELECT COUNT(*) FROM threads", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|n| n as usize)
+        .unwrap_or(0)
     }
 
     /// Whether no thread has been recorded yet.
@@ -244,6 +256,89 @@ fn touch(conn: &Connection, thread_id: &str, now: i64) -> rusqlite::Result<()> {
         params![thread_id, now],
     )?;
     Ok(())
+}
+
+/// Read a thread's stored transcript, oldest first.
+fn read_history(conn: &Connection, thread_id: &str) -> Vec<ChatMessage> {
+    let mut stmt = match conn
+        .prepare("SELECT role, content FROM messages WHERE thread_id = ?1 ORDER BY seq")
+    {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            report("read transcript", e);
+            return Vec::new();
+        }
+    };
+    let rows = stmt.query_map(params![thread_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    });
+    let mut out = Vec::new();
+    if let Ok(rows) = rows {
+        for (role, content) in rows.flatten() {
+            if let Some(message) = chat_from_row(&role, &content) {
+                out.push(message);
+            }
+        }
+    }
+    out
+}
+
+/// The part of `forwarded` this thread has not recorded yet.
+///
+/// The client may send the whole conversation or only its last message, so the
+/// new turn is *located* rather than assumed:
+///
+/// * messages the two copies agree on from the front are already recorded —
+///   `agreed` is how far they match;
+/// * the turn starts at the first user message from there on, so an assistant
+///   reply the client echoes back (whose text can differ from ours by a
+///   whitespace and would otherwise be recorded twice) is skipped;
+/// * a candidate the store already ends with is dropped, which is what makes a
+///   re-sent turn and a client that repeats its last message idempotent.
+///
+/// Known limit: a client that forwards two unheard turns at once records only
+/// the trailing one. One run carries one new turn, so this cannot happen in
+/// normal use — it would take a silently lost run.
+fn pending_turn(stored: &[ChatMessage], forwarded: &[ChatMessage]) -> Vec<ChatMessage> {
+    if forwarded.is_empty() {
+        return Vec::new();
+    }
+    // Nothing recorded yet: the forwarded conversation is all there is, so adopt
+    // it whole rather than guessing where its turn starts.
+    if stored.is_empty() {
+        return forwarded.to_vec();
+    }
+
+    let agreed = stored
+        .iter()
+        .zip(forwarded)
+        .take_while(|(stored, forwarded)| same_message(stored, forwarded))
+        .count();
+    let start = forwarded[agreed..]
+        .iter()
+        .position(|message| message.role == Role::User)
+        .map_or(agreed, |offset| agreed + offset);
+    let candidate = &forwarded[start..];
+
+    if ends_with(stored, candidate) {
+        return Vec::new();
+    }
+    candidate.to_vec()
+}
+
+/// Whether two messages carry the same role and text. Tool traffic never
+/// reaches this store, so those fields are not compared.
+fn same_message(a: &ChatMessage, b: &ChatMessage) -> bool {
+    a.role == b.role && a.content == b.content
+}
+
+/// Whether `haystack` ends with every message in `needle`.
+fn ends_with(haystack: &[ChatMessage], needle: &[ChatMessage]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack[haystack.len() - needle.len()..]
+            .iter()
+            .zip(needle)
+            .all(|(a, b)| same_message(a, b))
 }
 
 /// Store one message. Messages with no text (an assistant turn that only calls
@@ -302,6 +397,14 @@ fn report(action: &str, error: rusqlite::Error) {
 mod tests {
     use super::*;
 
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage::user(text)
+    }
+
+    fn assistant(text: &str) -> ChatMessage {
+        ChatMessage::assistant(text)
+    }
+
     #[test]
     fn records_and_reads_back_a_transcript() {
         let store = ThreadStore::new();
@@ -326,19 +429,61 @@ mod tests {
     }
 
     #[test]
-    fn record_replaces_the_whole_transcript() {
+    fn merge_records_only_the_turn_the_store_has_not_seen() {
         let store = ThreadStore::new();
-        store.record("t1", &[ChatMessage::user("one")]);
-        // Simulates the second turn: the client resends its cumulative history.
-        store.record(
-            "t1",
-            &[ChatMessage::user("one"), ChatMessage::assistant("two"), ChatMessage::user("three")],
-        );
+        assert_eq!(store.merge("t1", &[user("one")]).len(), 1);
+        // The assistant's reply is captured when the run finishes.
+        store.append("t1", &[assistant("two")]);
 
-        let history = store.history("t1");
+        // Second turn: the client re-sends its cumulative history.
+        let history = store.merge("t1", &[user("one"), assistant("two"), user("three")]);
         assert_eq!(history.len(), 3);
         assert_eq!(history[2].content.as_deref(), Some("three"));
+        assert_eq!(store.history("t1").len(), 3);
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn merge_keeps_earlier_turns_when_the_client_forwards_one_message() {
+        let store = ThreadStore::new();
+        store.append("t1", &[user("one"), assistant("two")]);
+        store.append("t1", &[user("three"), assistant("four")]);
+
+        // A client that trims what it forwards sends only the pending message.
+        // The model must still get everything the server recorded before it.
+        let history = store.merge("t1", &[user("five")]);
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[0].content.as_deref(), Some("one"));
+        assert_eq!(history[4].content.as_deref(), Some("five"));
+    }
+
+    #[test]
+    fn merge_does_not_duplicate_a_turn_the_client_repeats() {
+        let store = ThreadStore::new();
+        store.append("t1", &[user("one"), assistant("two")]);
+
+        // A re-run of the same turn, and a client that forwards only its last
+        // message: both add nothing the store does not already hold.
+        assert_eq!(store.merge("t1", &[user("one"), assistant("two")]).len(), 2);
+        assert_eq!(store.merge("t1", &[assistant("two")]).len(), 2);
+    }
+
+    #[test]
+    fn merge_seeds_an_empty_store_from_the_forwarded_conversation() {
+        let store = ThreadStore::new();
+        // A restart leaves no record, but the client still has the thread.
+        let history = store.merge("t1", &[user("one"), assistant("two"), user("three")]);
+        assert_eq!(history.len(), 3);
+        assert_eq!(store.history("t1").len(), 3);
+    }
+
+    #[test]
+    fn an_echoed_reply_that_drifted_is_not_recorded_twice() {
+        let stored = vec![user("one"), assistant("two")];
+        // The client's copy of the reply differs from ours by a trailing space.
+        let pending = pending_turn(&stored, &[user("one"), assistant("two "), user("three")]);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content.as_deref(), Some("three"));
     }
 
     #[test]

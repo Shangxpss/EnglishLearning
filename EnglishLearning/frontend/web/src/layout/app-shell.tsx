@@ -3,7 +3,7 @@ import { CopilotPopup, useAgent } from '@copilotkit/react-core/v2';
 import { navItems } from '@/router/navigation';
 import { cn } from '@/lib/utils';
 import { useAuth, AUTH_DISABLED } from '@/providers/auth-context';
-import { getChatThreadId, NEW_CHAT_THREAD_EVENT } from '@/lib/chat-thread';
+import { getChatThreadId, CHAT_THREAD_CHANGED_EVENT } from '@/lib/chat-thread';
 import { getChatMessages, type ChatMessage } from '@/lib/chat-api';
 import { useEffect, useRef, useState } from 'react';
 
@@ -33,27 +33,30 @@ function seedMessages(history: ChatMessage[]) {
  * The v2 chat view never fetches thread history — that lives behind the
  * licence-gated threads drawer — and the AG-UI client mints a fresh thread per
  * page load, so without this the popup would come back empty after a reload
- * even though the conversation is still on the server. Runs once per thread and
- * never overwrites a conversation already in progress.
+ * even though the conversation is still on the server. Runs once per thread;
+ * a switch to another thread replaces what is on screen.
  */
 function ChatThreadHydrator({ threadId }: { threadId: string }) {
   const { agent, isReady } = useAgent({ agentId: ASSISTANT_AGENT_ID });
   const seeded = useRef<string | null>(null);
+  const previous = useRef<string | null>(null);
 
   useEffect(() => {
     // The provisional pre-sync agent is a stand-in that gets swapped out, so
     // only touch the real one.
     if (!isReady || seeded.current === threadId) return;
+    // A deliberate switch — re-pinning an older conversation from the History
+    // page, or starting a new one — must replace whatever is on screen. Only the
+    // first load has to be careful not to clobber a message that raced the fetch.
+    const switched = previous.current !== null && previous.current !== threadId;
+    previous.current = threadId;
     let cancelled = false;
     getChatMessages(threadId)
       .then((history) => {
         if (cancelled) return;
         seeded.current = threadId;
         const seed = seedMessages(history);
-        // Preserve a conversation already on screen (the fetch may have raced a
-        // just-sent message); an empty history is a fresh thread, which must
-        // clear the previous one rather than keep showing it.
-        if (seed.length > 0 && agent.messages.length > 0) return;
+        if (!switched && seed.length > 0 && agent.messages.length > 0) return;
         agent.setMessages(seed);
       })
       .catch(() => {
@@ -73,13 +76,14 @@ export function AppShell() {
   const location = useLocation();
 
   // The thread the floating assistant is pinned to. Read once, then follow
-  // "New chat" events so the popup (mounted for the whole session) switches to
-  // a fresh conversation without a reload.
+  // change events so the popup (mounted for the whole session) switches
+  // without a reload — both to a fresh conversation ("New chat") and to an
+  // older one picked on the History page.
   const [chatThreadId, setChatThreadId] = useState(() => getChatThreadId());
   useEffect(() => {
-    const onNewThread = () => setChatThreadId(getChatThreadId());
-    window.addEventListener(NEW_CHAT_THREAD_EVENT, onNewThread);
-    return () => window.removeEventListener(NEW_CHAT_THREAD_EVENT, onNewThread);
+    const onThreadChange = () => setChatThreadId(getChatThreadId());
+    window.addEventListener(CHAT_THREAD_CHANGED_EVENT, onThreadChange);
+    return () => window.removeEventListener(CHAT_THREAD_CHANGED_EVENT, onThreadChange);
   }, []);
 
   // Redirect to login if not authenticated.

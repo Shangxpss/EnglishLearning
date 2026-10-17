@@ -32,7 +32,9 @@
 //! | `DELETE` | `/copilotkit/threads/{thread_id}` | forget a thread |
 //! | `POST` | `/copilotkit/agent/{agent_id}/stop/{thread_id}` | see [`stop_run`] |
 //! | `POST` | `/copilotkit/agent/{agent_id}/connect` | see [`connect_run`] |
+//! | `GET` | `/copilotkit/debug/events` | tap on the run event stream, see [`debug`] |
 
+pub mod debug;
 pub mod middleware;
 
 use crate::agent::config::AgentConfig;
@@ -40,6 +42,7 @@ use crate::agent::engine::{self, EventSink, RequestEnricher, SinkClosed, ThreadS
 use crate::agent::llm::{ChatMessage, LlmError, OpenAiClient};
 use crate::agent::new_id;
 use crate::agent::tools::ToolRegistry;
+use debug::DebugBus;
 use middleware::A2uiMiddleware;
 
 use ag_ui::axum::RouterExt;
@@ -71,6 +74,8 @@ pub struct CopilotAgent {
     llm: OpenAiClient,
     threads: ThreadStore,
     middleware: A2uiMiddleware,
+    /// The tap every run's events are mirrored to (see the [`debug`] module).
+    debug: DebugBus,
     started: Instant,
 }
 
@@ -92,6 +97,7 @@ impl CopilotAgent {
             llm,
             threads,
             middleware,
+            debug: DebugBus::new(),
             started: Instant::now(),
         })
     }
@@ -119,7 +125,9 @@ impl Agent for CopilotAgent {
             return Err(error_message("the request contained no user message"));
         }
 
-        let mut sink = RunContextSink { ctx };
+        let mut inner = RunContextSink { ctx };
+        // The run's events go to the client *and* to the debug tap.
+        let mut sink = debug::DebugTap::wrap(&mut inner, &self.debug, &thread_id);
         match engine::run_turn(
             &self.cfg,
             &self.llm,
@@ -174,11 +182,13 @@ fn error_message(message: impl Into<String>) -> ag_ui::server::Error {
 
 /// Read the client's conversation from the run context.
 ///
-/// AG-UI sends the whole history with every run, so the context — not a local
-/// store — is the source of truth. `Message` is a protocol union whose content
-/// may be a string or an array of parts, so it is flattened through its JSON
-/// form rather than matched field by field; that keeps working when the
-/// protocol adds a message kind.
+/// AG-UI sends the whole history with every run. That payload is *not* the
+/// record any more — [`ThreadStore::merge`] only diffs it against the stored
+/// transcript to find the new turn (see [`crate::agent::engine::state`]) — but it
+/// is still how the new turn and the client's ambient context arrive. `Message`
+/// is a protocol union whose content may be a string or an array of parts, so it
+/// is flattened through its JSON form rather than matched field by field; that
+/// keeps working when the protocol adds a message kind.
 fn history_from(ctx: &RunContext<()>) -> Vec<ChatMessage> {
     let Ok(value) = serde_json::to_value(ctx.messages()) else {
         return Vec::new();
@@ -348,6 +358,17 @@ async fn stop_run(
 /// in-memory runner, which completes immediately for a thread it does not know.
 /// It has to be `200`: the client paints an error banner over the chat for any
 /// other status, so answering `404` makes a pinned chat look broken.
+///
+/// The reference runtime *does* replay here: its in-memory runner keeps every
+/// run's compacted AG-UI events per thread, and `connect` sends them to a joining
+/// client (`@copilotkit/runtime/dist/v2/runtime/runner/in-memory.mjs`, `connect`).
+/// The client expects that — on a *fresh* thread restore its `connectAgent` clears
+/// the local messages and joins this stream to rebuild them (`@copilotkit/core`
+/// `RunHandler.connectAgent`). This crate keeps no event log, only the transcript
+/// (`ThreadStore`), so the events to replay do not exist. Emitting a
+/// `MESSAGES_SNAPSHOT` from here instead would be a second hydration path racing
+/// the app's own: the chat already seeds itself from
+/// `GET /copilotkit/threads/{id}/messages`, which is the server-owned transcript.
 async fn connect_run(
     State(agent): State<Arc<CopilotAgent>>,
     Path(agent_id): Path<String>,
@@ -390,6 +411,7 @@ pub fn router(agent: Arc<CopilotAgent>) -> Router {
             post(stop_run),
         )
         .route("/copilotkit/agent/{agent_id}/connect", post(connect_run))
+        .route("/copilotkit/debug/events", get(debug::events))
         .with_state(Arc::clone(&agent))
         // `route_agui` supplies request parsing, ordering verification, SSE
         // framing, content negotiation and disconnect cancellation.

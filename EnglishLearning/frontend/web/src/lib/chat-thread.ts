@@ -7,7 +7,8 @@
  * Keeping the id in `localStorage` makes a reload resume the same thread — which
  * the server can then replay, because it persists each thread's transcript.
  *
- * "New chat" clears the id, so the next load mints a fresh one.
+ * "New chat" clears the id, so the next load mints a fresh one; re-pinning an
+ * older conversation (the History page) writes that thread's id instead.
  */
 
 const STORAGE_KEY = "english-learning.chat-thread";
@@ -44,8 +45,23 @@ export function resetChatThread(): void {
   }
 }
 
-/** Fired after [`startNewChatThread`] so a mounted popup re-pins immediately. */
-export const NEW_CHAT_THREAD_EVENT = "chat-thread:new";
+/** Fired whenever the pinned thread changes, so a mounted popup re-pins at once. */
+export const CHAT_THREAD_CHANGED_EVENT = "chat-thread:changed";
+
+/**
+ * Re-pin the floating assistant to an existing conversation, so it continues
+ * that thread instead of the one it was on.
+ */
+export function setChatThreadId(id: string): string {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, id);
+  } catch {
+    // Storage disabled: the popup still switches for this session, it just
+    // will not survive a reload.
+  }
+  window.dispatchEvent(new Event(CHAT_THREAD_CHANGED_EVENT));
+  return id;
+}
 
 /**
  * Start a fresh conversation: drop the pinned id, mint a new one, and tell the
@@ -54,6 +70,6 @@ export const NEW_CHAT_THREAD_EVENT = "chat-thread:new";
 export function startNewChatThread(): string {
   resetChatThread();
   const id = getChatThreadId();
-  window.dispatchEvent(new Event(NEW_CHAT_THREAD_EVENT));
+  window.dispatchEvent(new Event(CHAT_THREAD_CHANGED_EVENT));
   return id;
 }

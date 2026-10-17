@@ -183,11 +183,13 @@ macro_rules! emit_or_stop {
 
 /// Run one agent turn, writing AG-UI events into `sink`.
 ///
-/// The conversation comes from `messages` (AG-UI is stateless per run); a copy is
-/// also recorded against `threads` for chat history. That copy is the client's
-/// cumulative history — replaced, not appended, so turns don't pile up — and the
-/// assistant's own reply is appended as it is produced. The run framing
-/// events (`RUN_STARTED`/`RUN_FINISHED`/`RUN_ERROR`) are the caller's job.
+/// The model's conversation comes from `threads`, not from `messages`: AG-UI
+/// re-sends the whole history with every run, but that payload is a claim about
+/// the thread, and a client may forward only its last message. [`ThreadStore::merge`]
+/// records just the turn that is new and hands back the full transcript, so the
+/// client's copy cannot erase or duplicate what the server already knows; the
+/// assistant's own reply is appended as it is produced. The run framing events
+/// (`RUN_STARTED`/`RUN_FINISHED`/`RUN_ERROR`) are the caller's job.
 ///
 /// `video` is the transcript of the video the user currently has open, if any.
 /// It rides in the system message so the model can answer questions *about the
@@ -204,7 +206,11 @@ pub async fn run_turn(
     video: Option<&str>,
     sink: &mut dyn EventSink,
 ) -> Result<(), LlmError> {
-    threads.record(thread_id, &messages);
+    // Record only the turn the store has not seen, and take the whole transcript
+    // back as the memory the model gets (`messages` is the claim, `history` the
+    // record). A trimmed payload therefore cannot shorten earlier turns, and a
+    // turn the client re-sends cannot be stored twice.
+    let history = threads.merge(thread_id, &messages);
 
     let mut system = prompt::system_prompt(cfg);
     if let Some(transcript) = video.filter(|text| !text.trim().is_empty()) {
@@ -212,9 +218,9 @@ pub async fn run_turn(
         system.push_str(&prompt::video_transcript_prompt(transcript));
     }
 
-    let mut conversation = Vec::with_capacity(messages.len() + 1);
+    let mut conversation = Vec::with_capacity(history.len() + 1);
     conversation.push(ChatMessage::system(system));
-    conversation.extend(messages);
+    conversation.extend(history);
     enricher.prepare(&mut conversation);
 
     let tool_specs = registry.specs();
@@ -321,11 +327,7 @@ pub async fn run_turn(
 
             emit_or_stop!(
                 sink,
-                Event::tool_call_result(
-                    new_id("tool"),
-                    call.id.clone(),
-                    content.clone()
-                )
+                Event::tool_call_result(new_id("tool"), call.id.clone(), content.clone())
             );
 
             if let Some(operations) = a2ui {
@@ -410,7 +412,10 @@ mod tests {
         assert_eq!(event_type(&event), "ACTIVITY_SNAPSHOT");
 
         let value = serde_json::to_value(&event).unwrap();
-        assert_eq!(value["activityType"], crate::agent::protocol::A2UI_ACTIVITY_TYPE);
+        assert_eq!(
+            value["activityType"],
+            crate::agent::protocol::A2UI_ACTIVITY_TYPE
+        );
         assert_eq!(value["content"]["tool"], "display_register_form");
         assert_eq!(
             value["content"][crate::agent::protocol::a2ui::A2UI_OPERATIONS_KEY][0]["createSurface"]
@@ -434,7 +439,10 @@ mod tests {
         sink.emit(Event::step_started("model")).unwrap();
         sink.emit(Event::step_finished("model")).unwrap();
         for name in sink.names() {
-            assert!(!name.starts_with("RUN_"), "engine emitted a run framing event: {name}");
+            assert!(
+                !name.starts_with("RUN_"),
+                "engine emitted a run framing event: {name}"
+            );
         }
     }
 }
